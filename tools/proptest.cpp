@@ -49,6 +49,48 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    // proptest --audio|--asset|--dds <dll> <file>..: the .wav/.xwm, .tga/.fuz or .dds handler
+    const bool audio = !wcscmp(argv[1], L"--audio"), asset = !wcscmp(argv[1], L"--asset"), dds = !wcscmp(argv[1], L"--dds");
+    if ((audio || asset || dds) && argc >= 4) {
+        HMODULE lib = LoadLibraryW(argv[2]);
+        auto gco = lib ? reinterpret_cast<HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**)>(GetProcAddress(lib, "DllGetClassObject")) : nullptr;
+        IClassFactory* f = nullptr;
+        const CLSID which = audio ? pse::kClsidAudioWrapHandler : asset ? pse::kClsidAssetPropertyHandler : pse::kClsidDdsPropertyHandler;
+        if (!gco || FAILED(gco(which, IID_PPV_ARGS(&f)))) return 2;
+        int bad = 0;
+        for (int i = 3; i < argc; ++i) {
+            wprintf(L"== %s\n", argv[i]);
+            IInitializeWithFile* init = nullptr;
+            IPropertyStore* store = nullptr;
+            if (FAILED(f->CreateInstance(nullptr, IID_PPV_ARGS(&init))) || FAILED(init->Initialize(argv[i], STGM_READ)) ||
+                FAILED(init->QueryInterface(IID_PPV_ARGS(&store)))) {
+                wprintf(L"failed to open\n");
+                ++bad;
+            } else {
+                DWORD count = 0;
+                store->GetCount(&count);
+                for (DWORD k = 0; k < count; ++k) {
+                    PROPERTYKEY key{};
+                    store->GetAt(k, &key);
+                    PROPVARIANT pv;
+                    PropVariantInit(&pv);
+                    store->GetValue(key, &pv);
+                    PWSTR text = nullptr;
+                    wchar_t fmt[64] = {};
+                    StringFromGUID2(key.fmtid, fmt, 64);
+                    if (SUCCEEDED(PropVariantToStringAlloc(pv, &text))) {
+                        wprintf(L"  %s/%lu  %s\n", fmt, key.pid, text);
+                        CoTaskMemFree(text);
+                    }
+                    PropVariantClear(&pv);
+                }
+            }
+            if (store) store->Release();
+            if (init) init->Release();
+        }
+        f->Release();
+        return bad ? 1 : 0;
+    }
     HMODULE dll = LoadLibraryW(argv[1]);
     auto getClassObject = dll ? reinterpret_cast<HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**)>(
                                     GetProcAddress(dll, "DllGetClassObject"))

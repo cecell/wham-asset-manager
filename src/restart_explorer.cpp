@@ -3,7 +3,7 @@
 // taskbar), so this does what Task Manager's "Restart" does, more gently:
 //  1. asks the shell to exit, as Ctrl+Shift+right-click on the taskbar > Exit
 //     Explorer does, so it saves its state;
-//  2. waits up to 5 s, then ends any Explorer process of this session left
+//  2. waits up to 10 s, then ends any Explorer process of this session left
 //     (folder windows in their own process, a shell that didn't exit);
 //  3. starts explorer.exe again and waits for the taskbar.
 // Other programs that load the DLL (Everything's right-click menu, for one)
@@ -66,7 +66,7 @@ HRESULT RestartExplorer() {
     if (!tray) return S_FALSE;  // no shell running here: nothing to restart
 
     PostMessageW(tray, kExitExplorer, 0, 0);
-    WaitFor(5000, [] { return ExplorerProcesses().empty(); });
+    WaitFor(10000, [] { return ExplorerProcesses().empty(); });
     for (DWORD pid : ExplorerProcesses()) {
         if (HANDLE p = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid)) {
             TerminateProcess(p, 0);

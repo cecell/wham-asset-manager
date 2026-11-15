@@ -84,7 +84,7 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
     }
     pse::DebugLog(L"DllGetClassObject menu=%d props=%d", clsid == pse::kClsidContextMenu,
                  clsid == pse::kClsidPropertyHandler || clsid == pse::kClsidAssetPropertyHandler ||
-                 clsid == pse::kClsidDdsPropertyHandler);
+                 clsid == pse::kClsidDdsPropertyHandler || clsid == pse::kClsidAudioWrapHandler);
     if (clsid == pse::kClsidBsaFolder) return pse::CreateBsaFolderFactory(riid, ppv);
     if (clsid == pse::kClsidBsaManager) return pse::CreateBsaManagerFactory(riid, ppv);
     if (clsid == pse::kClsidBsaDrop) return pse::CreateBsaDropFactory(riid, ppv);
@@ -96,6 +96,7 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
     if (clsid == pse::kClsidAssetPropertyHandler) return pse::CreateAssetPropertyHandlerFactory(riid, ppv);
     if (clsid == pse::kClsidFilePropertyHandler) return pse::CreateFilePropertyHandlerFactory(riid, ppv);
     if (clsid == pse::kClsidDdsPropertyHandler) return pse::CreateDdsPropertyHandlerFactory(riid, ppv);
+    if (clsid == pse::kClsidAudioWrapHandler) return pse::CreateAudioWrapHandlerFactory(riid, ppv);
     if (clsid == pse::kClsidHardlinkMenu) return pse::CreateHardlinkMenuFactory(riid, ppv);
     return CLASS_E_CLASSNOTAVAILABLE;
 }

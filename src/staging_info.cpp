@@ -2,7 +2,14 @@
 
 #include <windows.h>
 
+#include <climits>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "staging_find.h"
@@ -12,16 +19,6 @@ namespace {
 
 constexpr ULONGLONG kRefreshMs = 30000;
 
-struct Root {
-    std::wstring dir;  // lower case, one trailing backslash
-    bool hardlinks;    // Vortex (or a saved folder): deployed files are hardlinks into Data
-};
-struct Layout {
-    std::wstring data;  // lower case, one trailing backslash; empty = no game found
-    std::wstring dataAsIs;
-    std::vector<Root> roots;
-};
-
 std::wstring Lower(std::wstring s) {
     if (!s.empty()) CharLowerBuffW(s.data(), static_cast<DWORD>(s.size()));
     return s;
@@ -30,17 +27,85 @@ std::wstring WithSlash(std::wstring s) {
     if (!s.empty() && s.back() != L'\\') s += L'\\';
     return s;
 }
+bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// An MO2 profile's mod order. MO2 deploys nothing: while the game runs it shows
+// the mods as if they were in Data, the first mod of modlist.txt winning.
+struct Mo2Profile {
+    std::wstring mods;       // the mods folder, as is, with a trailing backslash
+    std::wstring overwrite;  // the overwrite folder (wins over every mod)
+    std::vector<std::wstring> names, lowerNames;  // modlist.txt order: first = highest priority
+    std::vector<bool> enabled;
+    std::mutex lock;
+    std::map<std::wstring, std::vector<size_t>> withDir;  // a relative folder -> the enabled mods that have it
+
+    size_t Find(const std::wstring& lowerName) const {
+        for (size_t i = 0; i < lowerNames.size(); ++i)
+            if (lowerNames[i] == lowerName) return i;
+        return SIZE_MAX;
+    }
+    // The enabled mods that have `dir` (lower case, "" or "textures\\armor\\"), in order.
+    std::vector<size_t> ModsWithDir(const std::wstring& dir) {
+        std::lock_guard<std::mutex> g(lock);
+        auto it = withDir.find(dir);
+        if (it != withDir.end()) return it->second;
+        std::vector<size_t> out;
+        for (size_t i = 0; i < names.size(); ++i)
+            if (enabled[i] && (dir.empty() || Exists(mods + names[i] + L"\\" + dir))) out.push_back(i);
+        if (withDir.size() > 2000) withDir.clear();
+        withDir[dir] = out;
+        return out;
+    }
+};
+
+std::shared_ptr<Mo2Profile> ReadMo2Profile(const StagingCandidate& c) {
+    if (c.instance.empty() || c.profile.empty()) return nullptr;
+    const Mo2Folders f = ResolveMo2Folders(c.instance);
+    const int len = MultiByteToWideChar(CP_UTF8, 0, c.profile.data(), static_cast<int>(c.profile.size()), nullptr, 0);
+    std::wstring profile(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, c.profile.data(), static_cast<int>(c.profile.size()), profile.data(), len);
+    std::ifstream in(std::filesystem::path(WithSlash(f.profiles) + profile + L"\\modlist.txt"), std::ios::binary);
+    if (!in) return nullptr;
+    auto p = std::make_shared<Mo2Profile>();
+    p->mods = WithSlash(f.mods);
+    p->overwrite = WithSlash(f.overwrite);
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.size() < 2 || line[0] == '#' || line[0] == '*') continue;  // * = DLC and other files MO2 doesn't manage
+        const bool on = line[0] != '-';
+        if (line[0] == '+' || line[0] == '-') line.erase(0, 1);
+        const int n = MultiByteToWideChar(CP_UTF8, 0, line.data(), static_cast<int>(line.size()), nullptr, 0);
+        std::wstring name(n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, line.data(), static_cast<int>(line.size()), name.data(), n);
+        p->names.push_back(name);
+        p->lowerNames.push_back(Lower(name));
+        p->enabled.push_back(on);
+    }
+    return p;
+}
+
+struct Root {
+    std::wstring dir;  // lower case, one trailing backslash
+    bool hardlinks;    // Vortex (or a saved folder): deployed files are hardlinks into Data
+    std::shared_ptr<Mo2Profile> mo2;  // MO2: the selected profile's order
+};
+struct Layout {
+    std::wstring data;  // lower case, one trailing backslash; empty = no game found
+    std::wstring dataAsIs;
+    std::vector<Root> roots;
+};
 
 std::mutex g_lock;
-Layout g_layout;
+std::shared_ptr<const Layout> g_layout;
 ULONGLONG g_layoutAt = 0;
-bool g_layoutSet = false;
 
-Layout Current() {
+std::shared_ptr<const Layout> Current() {
     std::lock_guard<std::mutex> g(g_lock);
     const ULONGLONG now = GetTickCount64();
-    if (g_layoutSet && now - g_layoutAt < kRefreshMs) return g_layout;
-    Layout l;
+    if (g_layout && now - g_layoutAt < kRefreshMs) return g_layout;
+    auto made = std::make_shared<Layout>();
+    Layout& l = *made;
     StagingResult r;
     std::string error;
     const StagingEnv env = CurrentStagingEnv();
@@ -54,12 +119,31 @@ Layout Current() {
         const std::wstring dir = Lower(WithSlash(c.staging));
         bool seen = false;
         for (const Root& x : l.roots) seen = seen || x.dir == dir;
-        if (!seen) l.roots.push_back({dir, c.manager != "mo2"});
+        if (seen) continue;
+        if (c.manager == "mo2") l.roots.push_back({dir, false, ReadMo2Profile(c)});
+        else l.roots.push_back({dir, true, nullptr});
     }
-    g_layout = l;
+    g_layout = made;
     g_layoutAt = now;
-    g_layoutSet = true;
-    return l;
+    return g_layout;
+}
+
+// Deployed for a file in an MO2 mod (`rest` = "Mod\textures\a.dds" as is).
+std::wstring Mo2Deployed(Mo2Profile& p, const std::wstring& rest) {
+    const size_t slash = rest.find(L'\\');
+    if (slash == std::wstring::npos) return {};
+    const std::wstring rel = rest.substr(slash + 1);
+    const size_t self = p.Find(Lower(rest.substr(0, slash)));
+    if (self == SIZE_MAX) return L"No (not in the MO2 profile)";
+    if (!p.enabled[self]) return L"No (disabled in MO2)";
+    if (Exists(p.overwrite + rel)) return L"No (Overwrite wins)";
+    const size_t cut = rel.find_last_of(L'\\');
+    const std::wstring dir = cut == std::wstring::npos ? std::wstring() : Lower(rel.substr(0, cut + 1));
+    for (size_t i : p.ModsWithDir(dir)) {
+        if (i >= self) break;
+        if (Exists(p.mods + p.names[i] + L"\\" + rel)) return L"No (" + p.names[i] + L" wins)";
+    }
+    return L"Yes";
 }
 
 // The root the path is in, and the part after it ("Mod\textures\a.dds").
@@ -148,7 +232,8 @@ std::wstring ModOfDataFile(const Layout& l, const std::wstring& path) {
 }  // namespace
 
 std::wstring ModOf(const std::wstring& path) {
-    const Layout l = Current();
+    const std::shared_ptr<const Layout> current = Current();
+    const Layout& l = *current;
     if (std::wstring mod = ModIn(l, path); !mod.empty()) return mod;
     if (!GameDataOf(path).empty()) return ModOfDataFile(l, path);  // in any game's Data (the active one, or a parked mode)
     // A staging folder no manager names (a deploy script's): the link in a game's
@@ -167,7 +252,8 @@ std::wstring ModOf(const std::wstring& path) {
 }
 
 std::wstring DeployedOf(const std::wstring& path) {
-    const Layout l = Current();
+    const std::shared_ptr<const Layout> current = Current();
+    const Layout& l = *current;
     if (l.data.empty()) return {};
     if (!GameDataOf(path).empty()) return {};  // a game's own files
     // Whoever deployed it: a hardlink of this very file in the game's Data
@@ -182,6 +268,7 @@ std::wstring DeployedOf(const std::wstring& path) {
     }
     std::wstring rest;
     const Root* root = RootOf(l, Lower(path), &rest);
+    if (root && root->mo2) return Mo2Deployed(*root->mo2, path.substr(path.size() - rest.size()));
     if (!root || !root->hardlinks) return elsewhere;
     const size_t slash = rest.find(L'\\');
     if (slash == std::wstring::npos) return {};

@@ -16,5 +16,6 @@ namespace pse {
 
 HRESULT CreateAssetPropertyHandlerFactory(REFIID riid, void** ppv);
 HRESULT CreateDdsPropertyHandlerFactory(REFIID riid, void** ppv);
+HRESULT CreateAudioWrapHandlerFactory(REFIID riid, void** ppv);
 
 }  // namespace pse

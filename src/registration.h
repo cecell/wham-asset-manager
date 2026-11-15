@@ -14,7 +14,7 @@ inline constexpr wchar_t kClsidString[] = L"{1D4348E0-3A45-489E-8022-6A2A883E9D9
 inline constexpr wchar_t kHandlerName[] = L"PluginShellExtension";
 inline constexpr wchar_t kHandlerDescription[] = L"WHAM context menu";
 inline constexpr const wchar_t* kExtensions[] = {L".esp", L".esm", L".esl"};
-// The asset property handler. Not .dds, .xwm or .wav: other handlers own those.
+// The asset property handler. Not .dds, .xwm or .wav: those are wrapped (see below).
 inline constexpr const wchar_t* kAssetExtensions[] = {L".tga", L".fuz"};
 inline constexpr const wchar_t* kFileHandlerExtensions[] = {L".nif", L".pex", L".psc", L".bsa", L".hkx", L".lip"};
 inline constexpr GUID kClsidFilePropertyHandler = {0xe3a17c58, 0x4b92, 0x4d06, {0xa6, 0xf1, 0x2c, 0x98, 0xb4, 0x7d, 0x10, 0xe5}};
@@ -43,6 +43,15 @@ inline constexpr wchar_t kDdsPropertyHandlerClsidString[] = L"{7C1F4E52-93A6-4B0
 inline constexpr GUID kClsidWindowsImageHandler = {0xa38b883c, 0x1682, 0x497e, {0x97, 0xb0, 0x0a, 0x3a, 0x9e, 0x80, 0x16, 0x82}};
 // Under our CLSID: the handler we replaced, so it can be called and put back.
 inline constexpr wchar_t kWrappedHandlerValue[] = L"WrappedHandler";
+
+// .wav and .xwm: like .dds, passes everything through to the handler that was
+// registered before (Windows' for .wav; .xwm's if one is installed) and adds
+// WHAM's audio columns, Mod and Deployed. The handler replaced for each
+// extension is recorded under our CLSID as "WrappedHandler.wav" etc.
+// {EECC8839-5F6E-4F3D-A93B-FE58EC609D13}
+inline constexpr GUID kClsidAudioWrapHandler = {0xeecc8839, 0x5f6e, 0x4f3d, {0xa9, 0x3b, 0xfe, 0x58, 0xec, 0x60, 0x9d, 0x13}};
+inline constexpr wchar_t kAudioWrapHandlerClsidString[] = L"{EECC8839-5F6E-4F3D-A93B-FE58EC609D13}";
+inline constexpr const wchar_t* kAudioWrapExtensions[] = {L".wav", L".xwm"};
 
 // Browsing .bsa as a folder.
 // {B0F2F3B6-3E4A-4F1E-9C57-2A8D61C0E4A7}

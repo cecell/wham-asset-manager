@@ -250,43 +250,72 @@ void RemoveBsaBrowser(HKEY root, const std::wstring& classes, const std::wstring
     RegDeleteKeyW(root, clsid.c_str());
 }
 
-bool InstallDdsHandler(HKEY root, const std::wstring& classes, const std::wstring& handlers, const std::wstring& dllPath) {
-    const std::wstring handlerKey = handlers + L".dds";
-    const std::wstring clsidKey = classes + L"CLSID\\" + kDdsPropertyHandlerClsidString;
+// Puts our wrapper in front of the handler an extension has now, recording that
+// handler under our CLSID (as `valueName`) so it can be called and put back.
+bool InstallWrapper(HKEY root, const std::wstring& classes, const std::wstring& handlers, const wchar_t* ext, const wchar_t* clsidString,
+                    const wchar_t* title, const std::wstring& valueName, const std::wstring& dllPath) {
+    const std::wstring handlerKey = handlers + ext;
+    const std::wstring clsidKey = classes + L"CLSID\\" + clsidString;
     wchar_t current[64] = {};
     DWORD size = sizeof(current);
     const bool had = RegGetValueW(root, handlerKey.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, current, &size) == ERROR_SUCCESS && current[0];
-    const bool alreadyOurs = had && _wcsicmp(current, kDdsPropertyHandlerClsidString) == 0;
-    LSTATUS st = SetString(root, clsidKey, nullptr, L"WHAM .dds property handler");
+    const bool alreadyOurs = had && _wcsicmp(current, clsidString) == 0;
+    LSTATUS st = SetString(root, clsidKey, nullptr, title);
     if (st == ERROR_SUCCESS) st = SetString(root, clsidKey + L"\\InprocServer32", nullptr, dllPath);
     if (st == ERROR_SUCCESS) st = SetString(root, clsidKey + L"\\InprocServer32", L"ThreadingModel", L"Both");
-    // On a reinstall the handler is already ours: keep what was recorded the first time.
-    if (st == ERROR_SUCCESS && had && !alreadyOurs) st = SetString(root, clsidKey, kWrappedHandlerValue, current);
-    if (st == ERROR_SUCCESS) st = SetString(root, handlerKey, nullptr, kDdsPropertyHandlerClsidString);
-    if (st != ERROR_SUCCESS && !alreadyOurs) {
-        RegDeleteTreeW(root, clsidKey.c_str());
-        RegDeleteKeyW(root, clsidKey.c_str());
-        return false;
+    // It is given the file's path (IInitializeWithFile): only allowed in the caller's process.
+    if (st == ERROR_SUCCESS) {
+        DWORD one = 1;
+        st = RegSetKeyValueW(root, clsidKey.c_str(), L"DisableProcessIsolation", REG_DWORD, &one, sizeof(one));
     }
+    // On a reinstall the handler is already ours: keep what was recorded the first time.
+    if (st == ERROR_SUCCESS && had && !alreadyOurs) st = SetString(root, clsidKey, valueName.c_str(), current);
+    if (st == ERROR_SUCCESS) st = SetString(root, handlerKey, nullptr, clsidString);
     return st == ERROR_SUCCESS;
 }
 
-void RemoveDdsHandler(HKEY root, const std::wstring& classes, const std::wstring& handlers) {
-    const std::wstring handlerKey = handlers + L".dds";
-    const std::wstring clsidKey = classes + L"CLSID\\" + kDdsPropertyHandlerClsidString;
+// Puts back the handler recorded for `ext` (or none, when there was none).
+void RemoveWrapper(HKEY root, const std::wstring& classes, const std::wstring& handlers, const wchar_t* ext, const wchar_t* clsidString,
+                   const std::wstring& valueName) {
+    const std::wstring handlerKey = handlers + ext;
+    const std::wstring clsidKey = classes + L"CLSID\\" + clsidString;
     wchar_t current[64] = {};
     DWORD size = sizeof(current);
-    if (RegGetValueW(root, handlerKey.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, current, &size) == ERROR_SUCCESS &&
-        _wcsicmp(current, kDdsPropertyHandlerClsidString) == 0) {
+    if (RegGetValueW(root, handlerKey.c_str(), nullptr, RRF_RT_REG_SZ, nullptr, current, &size) == ERROR_SUCCESS && _wcsicmp(current, clsidString) == 0) {
         wchar_t wrapped[64] = {};
         size = sizeof(wrapped);
-        if (RegGetValueW(root, clsidKey.c_str(), kWrappedHandlerValue, RRF_RT_REG_SZ, nullptr, wrapped, &size) == ERROR_SUCCESS && wrapped[0])
+        if (RegGetValueW(root, clsidKey.c_str(), valueName.c_str(), RRF_RT_REG_SZ, nullptr, wrapped, &size) == ERROR_SUCCESS && wrapped[0])
             SetString(root, handlerKey, nullptr, wrapped);
         else
             RegDeleteKeyW(root, handlerKey.c_str());
     }
+}
+
+void RemoveWrapperClass(HKEY root, const std::wstring& classes, const wchar_t* clsidString) {
+    const std::wstring clsidKey = classes + L"CLSID\\" + clsidString;
     RegDeleteTreeW(root, clsidKey.c_str());
     RegDeleteKeyW(root, clsidKey.c_str());
+}
+
+bool InstallDdsHandler(HKEY root, const std::wstring& classes, const std::wstring& handlers, const std::wstring& dllPath) {
+    return InstallWrapper(root, classes, handlers, L".dds", kDdsPropertyHandlerClsidString, L"WHAM .dds property handler", kWrappedHandlerValue, dllPath);
+}
+
+void RemoveDdsHandler(HKEY root, const std::wstring& classes, const std::wstring& handlers) {
+    RemoveWrapper(root, classes, handlers, L".dds", kDdsPropertyHandlerClsidString, kWrappedHandlerValue);
+    RemoveWrapperClass(root, classes, kDdsPropertyHandlerClsidString);
+}
+
+void InstallAudioWrappers(HKEY root, const std::wstring& classes, const std::wstring& handlers, const std::wstring& dllPath) {
+    for (const wchar_t* ext : kAudioWrapExtensions)
+        InstallWrapper(root, classes, handlers, ext, kAudioWrapHandlerClsidString, L"WHAM audio property handler",
+                       std::wstring(kWrappedHandlerValue) + ext, dllPath);
+}
+
+void RemoveAudioWrappers(HKEY root, const std::wstring& classes, const std::wstring& handlers) {
+    for (const wchar_t* ext : kAudioWrapExtensions)
+        RemoveWrapper(root, classes, handlers, ext, kAudioWrapHandlerClsidString, std::wstring(kWrappedHandlerValue) + ext);
+    RemoveWrapperClass(root, classes, kAudioWrapHandlerClsidString);
 }
 
 HRESULT RegisterPropertyHandler(const std::wstring& dllPath, const std::wstring& schemaPath) {
@@ -313,12 +342,17 @@ HRESULT RegisterPropertyHandler(const std::wstring& dllPath, const std::wstring&
             st = SetString(HKEY_LOCAL_MACHINE, std::wstring(kPropertyHandlers) + ext, nullptr,
                            kPropertyHandlerClsidString);
     }
-    // The asset handler reads a stream, so Windows can keep it out of Explorer's
-    // process. An extension another handler already owns is left alone.
+    // The asset handler (.tga, .fuz) is given the file's path, for Mod and Deployed,
+    // so it runs in the caller's process too. An extension another handler
+    // already owns is left alone.
     const std::wstring assetKey = std::wstring(kClasses) + L"CLSID\\" + kAssetPropertyHandlerClsidString;
     if (st == ERROR_SUCCESS) st = SetString(HKEY_LOCAL_MACHINE, assetKey, nullptr, L"WHAM asset property handler");
     if (st == ERROR_SUCCESS) st = SetString(HKEY_LOCAL_MACHINE, assetKey + L"\\InprocServer32", nullptr, dllPath);
     if (st == ERROR_SUCCESS) st = SetString(HKEY_LOCAL_MACHINE, assetKey + L"\\InprocServer32", L"ThreadingModel", L"Both");
+    if (st == ERROR_SUCCESS) {
+        DWORD one = 1;
+        st = RegSetKeyValueW(HKEY_LOCAL_MACHINE, assetKey.c_str(), L"DisableProcessIsolation", REG_DWORD, &one, sizeof(one));
+    }
     for (const wchar_t* ext : kAssetExtensions) {
         wchar_t current[64] = {};
         DWORD size = sizeof(current);
@@ -350,12 +384,14 @@ HRESULT RegisterPropertyHandler(const std::wstring& dllPath, const std::wstring&
     }
     // Not fatal: the plugin columns still work if .dds can't be taken over.
     InstallDdsHandler(HKEY_LOCAL_MACHINE, kClasses, kPropertyHandlers, dllPath);
+    InstallAudioWrappers(HKEY_LOCAL_MACHINE, kClasses, kPropertyHandlers, dllPath);
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return S_OK;
 }
 
 HRESULT UnregisterPropertyHandler(const std::wstring& schemaPath) {
     RemoveDdsHandler(HKEY_LOCAL_MACHINE, kClasses, kPropertyHandlers);
+    RemoveAudioWrappers(HKEY_LOCAL_MACHINE, kClasses, kPropertyHandlers);
     for (const wchar_t* ext : kExtensions) {
         std::wstring key = std::wstring(kPropertyHandlers) + ext;
         // Only remove the association if it is still ours.

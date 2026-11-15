@@ -4,6 +4,7 @@
 #include <propsys.h>
 #include <propvarutil.h>
 #include <shobjidl.h>
+#include <shlwapi.h>
 
 // Defines the PKEY_ values in this file, so it comes after the headers above.
 #include <initguid.h>
@@ -56,27 +57,38 @@ uint32_t FullMipCount(const asset::DdsInfo& d) {
     return levels;
 }
 
-// The handler to pass values through to: the one recorded when ours was
-// registered, else Windows' own.
-CLSID WrappedHandlerClsid() {
+enum class Mode { Plain, Dds, Audio };  // Dds and Audio wrap the handler they replaced
+
+// The handler recorded under our CLSID when ours was registered (`value`).
+bool RecordedHandler(const wchar_t* ourClsid, const std::wstring& value, CLSID* out) {
     wchar_t text[64] = {};
     DWORD size = sizeof(text);
-    const std::wstring key = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kDdsPropertyHandlerClsidString;
-    CLSID clsid;
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), kWrappedHandlerValue, RRF_RT_REG_SZ, nullptr, text, &size) == ERROR_SUCCESS &&
-        SUCCEEDED(CLSIDFromString(text, &clsid)) && !IsEqualCLSID(clsid, kClsidDdsPropertyHandler))
-        return clsid;
-    return kClsidWindowsImageHandler;
+    const std::wstring key = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + ourClsid;
+    CLSID ours{};
+    CLSIDFromString(ourClsid, &ours);
+    return RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), value.c_str(), RRF_RT_REG_SZ, nullptr, text, &size) == ERROR_SUCCESS &&
+           SUCCEEDED(CLSIDFromString(text, out)) && !IsEqualCLSID(*out, ours);
 }
 
-class AssetHandler final : public IInitializeWithStream, public IPropertyStore, public IPropertyStoreCapabilities {
+// .dds: the handler to pass values through to, else Windows' own.
+CLSID WrappedHandlerClsid() {
+    CLSID clsid;
+    return RecordedHandler(kDdsPropertyHandlerClsidString, kWrappedHandlerValue, &clsid) ? clsid : kClsidWindowsImageHandler;
+}
+
+
+// Initialized with the file's path, not a stream: a stream only knows the file's
+// name, and Mod / Deployed need its folder. So, like the plugin and file
+// handlers, it runs in the caller's process (DisableProcessIsolation) and opens
+// the file itself; a wrapped handler still gets a stream, as it would directly.
+class AssetHandler final : public IInitializeWithFile, public IPropertyStore, public IPropertyStoreCapabilities {
 public:
-    explicit AssetHandler(bool dds) : dds_(dds) { InterlockedIncrement(&g_dllRefs); }
+    explicit AssetHandler(Mode mode) : mode_(mode) { InterlockedIncrement(&g_dllRefs); }
 
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IInitializeWithStream) {
-            *ppv = static_cast<IInitializeWithStream*>(this);
+        if (riid == IID_IUnknown || riid == IID_IInitializeWithFile) {
+            *ppv = static_cast<IInitializeWithFile*>(this);
         } else if (riid == IID_IPropertyStore) {
             *ppv = static_cast<IPropertyStore*>(this);
         } else if (riid == IID_IPropertyStoreCapabilities) {
@@ -95,20 +107,25 @@ public:
         return static_cast<ULONG>(r);
     }
 
-    // IInitializeWithStream. A file the headers don't make sense of simply has
+    // IInitializeWithFile. A file the headers don't make sense of simply has
     // no properties: Explorer shows blanks, as for any file it can't read.
-    IFACEMETHODIMP Initialize(IStream* stream, DWORD mode) override {
-        if (!stream) return E_INVALIDARG;
+    IFACEMETHODIMP Initialize(LPCWSTR path, DWORD mode) override {
+        if (!path) return E_INVALIDARG;
         std::lock_guard<std::mutex> g(lock_);
         if (initialized_) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
         initialized_ = true;
+        // Read-only, and never in the way of anyone writing, renaming or deleting the file.
+        IStream* stream = nullptr;
+        if (FAILED(SHCreateStreamOnFileEx(path, STGM_READ | STGM_SHARE_DENY_NONE, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream))) return S_OK;
         try {
-            if (dds_) LoadDds(stream, mode);
+            if (mode_ == Mode::Dds) LoadDds(stream, mode, path);
             else Load(stream);
-            AddStaging(stream);
+            if (mode_ == Mode::Audio) WrapAudio(stream, mode, path);
+            AddStaging(path);
         } catch (const std::bad_alloc&) {
             Clear();
         }
+        stream->Release();  // a wrapped handler keeps its own reference while it needs one
         return S_OK;
     }
 
@@ -169,12 +186,8 @@ private:
         if (SUCCEEDED(InitPropVariantFromUInt64(value, &e.value))) values_.push_back(e);
     }
 
-    // Mod and Deployed need the file's path: a file stream names it.
-    void AddStaging(IStream* stream) {
-        STATSTG st{};
-        if (FAILED(stream->Stat(&st, STATFLAG_DEFAULT)) || !st.pwcsName) return;
-        const std::wstring path = st.pwcsName;
-        CoTaskMemFree(st.pwcsName);
+    // Mod and Deployed (staging_info.h).
+    void AddStaging(const std::wstring& path) {
         if (path.size() < 3 || path[1] != L':') return;
         const std::wstring mod = ModOf(path), deployed = DeployedOf(path);
         if (!mod.empty()) AddText(kPidMod, mod);
@@ -200,7 +213,15 @@ private:
         if (a.bitRate) AddUInt32(PKEY_Audio_EncodingBitrate, a.bitRate);
         if (a.sampleRate) AddUInt32(PKEY_Audio_SampleRate, a.sampleRate);
         if (a.channels) AddUInt32(PKEY_Audio_ChannelCount, a.channels);
-        if (a.container != asset::AudioContainer::Fuz) return;
+        if (a.container != asset::AudioContainer::Fuz) {
+            // .wav / .xwm: WHAM's Sample Rate, Channels and Audio Format columns too
+            if (mode_ != Mode::Audio) return;
+            if (a.sampleRate) AddUInt32(PROPERTYKEY{kPluginFmtid, kPidSampleRate}, a.sampleRate);
+            if (a.channels) AddUInt32(PROPERTYKEY{kPluginFmtid, kPidChannels}, a.channels);
+            const wchar_t* format = a.container == asset::AudioContainer::Xwm ? L"xWMA" : a.container == asset::AudioContainer::Wav ? L"WAV" : nullptr;
+            if (format) AddText(kPidAudioFormat, format);
+            return;
+        }
         // Our own columns as well: Explorer doesn't offer Windows' sample rate
         // and channel count in its list of columns.
         if (a.sampleRate) AddUInt32(PROPERTYKEY{kPluginFmtid, kPidSampleRate}, a.sampleRate);
@@ -221,7 +242,7 @@ private:
         }
     }
 
-    void LoadDds(IStream* stream, DWORD mode) {
+    void LoadDds(IStream* stream, DWORD mode, const std::wstring&) {
         std::vector<uint8_t> buf;
         asset::DdsInfo d;
         const bool ok = ReadPrefix(stream, asset::kDdsProbeBytes, &buf) && asset::read_dds(buf.data(), buf.size(), d) == asset::Status::Ok;
@@ -245,6 +266,35 @@ private:
         }
         // Without it, at least the size is still shown.
         if (!inner_ && ok) AddImage(d.width, d.height, d.bitsPerPixel);
+    }
+
+    // .wav / .xwm: the handler that was there before ours gets the stream from
+    // the start, as it would have directly. Where it answers a Windows property
+    // (Duration, Bit rate...) its value is the one shown, so ours are dropped.
+    void WrapAudio(IStream* stream, DWORD mode, const std::wstring& path) {
+        std::wstring ext = PathFindExtensionW(path.c_str());
+        if (!ext.empty()) CharLowerBuffW(ext.data(), static_cast<DWORD>(ext.size()));
+        CLSID clsid;
+        if (ext.empty() || !RecordedHandler(kAudioWrapHandlerClsidString, std::wstring(kWrappedHandlerValue) + ext, &clsid)) return;
+        LARGE_INTEGER zero{};
+        IInitializeWithStream* init = nullptr;
+        if (SUCCEEDED(stream->Seek(zero, STREAM_SEEK_SET, nullptr)) && SUCCEEDED(CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&init)))) {
+            if (SUCCEEDED(init->Initialize(stream, mode))) init->QueryInterface(IID_PPV_ARGS(&inner_));
+            init->Release();
+        }
+        if (!inner_) return;
+        for (auto it = values_.begin(); it != values_.end();) {
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            const bool theirs = !IsEqualGUID(it->key.fmtid, kPluginFmtid) && SUCCEEDED(inner_->GetValue(it->key, &v)) && v.vt != VT_EMPTY;
+            PropVariantClear(&v);
+            if (theirs) {
+                PropVariantClear(&it->value);
+                it = values_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void Load(IStream* stream) {
@@ -271,16 +321,16 @@ private:
     }
 
     long refs_ = 1;
-    const bool dds_;
+    const Mode mode_;
     std::mutex lock_;
     bool initialized_ = false;
     std::vector<Entry> values_;
-    IPropertyStore* inner_ = nullptr;  // .dds: the handler being wrapped
+    IPropertyStore* inner_ = nullptr;  // .dds, .wav, .xwm: the handler being wrapped
 };
 
 class Factory final : public IClassFactory {
 public:
-    explicit Factory(bool dds) : dds_(dds) { InterlockedIncrement(&g_dllRefs); }
+    explicit Factory(Mode mode) : mode_(mode) { InterlockedIncrement(&g_dllRefs); }
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IClassFactory) {
@@ -301,7 +351,7 @@ public:
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
-        auto* obj = new (std::nothrow) AssetHandler(dds_);
+        auto* obj = new (std::nothrow) AssetHandler(mode_);
         if (!obj) return E_OUTOFMEMORY;
         HRESULT hr = obj->QueryInterface(riid, ppv);
         obj->Release();
@@ -316,11 +366,11 @@ public:
 private:
     ~Factory() { InterlockedDecrement(&g_dllRefs); }
     long refs_ = 1;
-    const bool dds_;
+    const Mode mode_;
 };
 
-HRESULT MakeFactory(bool dds, REFIID riid, void** ppv) {
-    auto* factory = new (std::nothrow) Factory(dds);
+HRESULT MakeFactory(Mode mode, REFIID riid, void** ppv) {
+    auto* factory = new (std::nothrow) Factory(mode);
     if (!factory) return E_OUTOFMEMORY;
     HRESULT hr = factory->QueryInterface(riid, ppv);
     factory->Release();
@@ -329,7 +379,8 @@ HRESULT MakeFactory(bool dds, REFIID riid, void** ppv) {
 
 }  // namespace
 
-HRESULT CreateAssetPropertyHandlerFactory(REFIID riid, void** ppv) { return MakeFactory(false, riid, ppv); }
-HRESULT CreateDdsPropertyHandlerFactory(REFIID riid, void** ppv) { return MakeFactory(true, riid, ppv); }
+HRESULT CreateAssetPropertyHandlerFactory(REFIID riid, void** ppv) { return MakeFactory(Mode::Plain, riid, ppv); }
+HRESULT CreateDdsPropertyHandlerFactory(REFIID riid, void** ppv) { return MakeFactory(Mode::Dds, riid, ppv); }
+HRESULT CreateAudioWrapHandlerFactory(REFIID riid, void** ppv) { return MakeFactory(Mode::Audio, riid, ppv); }
 
 }  // namespace pse

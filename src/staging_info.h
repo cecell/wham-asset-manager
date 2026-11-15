@@ -9,8 +9,11 @@
 //   Deployed: for a file in a Vortex mod: "Yes" when Data has this very file
 //             (the same hardlink), "No (<mod> wins)" when Data has another
 //             mod's file there, "No (a loose file wins)" for a file no mod
-//             deployed, "No" when Data has nothing there. Empty elsewhere
-//             (and for MO2, which deploys nothing to Data).
+//             deployed, "No" when Data has nothing there. For a file in an
+//             MO2 mod (MO2 deploys nothing; it shows the mods as Data while
+//             the game runs): from the selected profile's modlist.txt, where
+//             the first line wins: "Yes", "No (Overwrite wins)", "No (<mod>
+//             wins)", "No (disabled in MO2)". Empty elsewhere.
 #pragma once
 
 #include <string>

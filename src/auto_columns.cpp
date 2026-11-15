@@ -303,6 +303,8 @@ void Request(HWND hwnd) {
     PostMessageW(hwnd, g_applyMessage, 0, 0);
 }
 
+constexpr UINT kMsgDetach = WM_APP + 1;  // to the watcher thread: lParam = a closing window
+
 class Sink : public IDispatch {
 public:
     Sink(REFIID iid, HWND hwnd, std::function<void()> onWindows) : iid_(iid), hwnd_(hwnd), onWindows_(std::move(onWindows)) {}
@@ -330,6 +332,8 @@ public:
     IFACEMETHODIMP GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID*) override { return E_NOTIMPL; }
     IFACEMETHODIMP Invoke(DISPID id, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*) override {
         if (iid_ == DIID_DWebBrowserEvents2 && id == DISPID_DOCUMENTCOMPLETE) Request(hwnd_);
+        // The window is closing: let go of it at once, or Explorer can't finish closing it.
+        if (iid_ == DIID_DWebBrowserEvents2 && id == DISPID_ONQUIT) PostThreadMessageW(GetCurrentThreadId(), kMsgDetach, 0, reinterpret_cast<LPARAM>(hwnd_));
         if (iid_ == DIID_DShellWindowsEvents && (id == DISPID_WINDOWREGISTERED || id == DISPID_WINDOWREVOKED) && onWindows_) onWindows_();
         return S_OK;
     }
@@ -353,16 +357,37 @@ DWORD WINAPI WatchThread(void*) {
         ComPtr<IShellWindows> windows;
         if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows)))) {
             std::map<HWND, Attached> attached;
+            auto detach = [&](HWND hwnd) {
+                auto it = attached.find(hwnd);
+                if (it == attached.end()) return;
+                it->second.cp->Unadvise(it->second.cookie);
+                attached.erase(it);
+            };
             auto attachAll = [&] {
-                for (auto it = attached.begin(); it != attached.end();) {  // closed windows
-                    if (!IsWindow(it->first)) {
+                // Windows ShellWindows no longer lists are closing: let go of them.
+                std::set<HWND> listed;
+                long count = 0;
+                windows->get_Count(&count);
+                for (long i = 0; i < count; ++i) {
+                    VARIANT v;
+                    VariantInit(&v);
+                    v.vt = VT_I4;
+                    v.lVal = i;
+                    ComPtr<IDispatch> disp;
+                    ComPtr<IWebBrowser2> wb;
+                    SHANDLE_PTR h = 0;
+                    if (SUCCEEDED(windows->Item(v, &disp)) && disp && SUCCEEDED(disp.As(&wb)) && SUCCEEDED(wb->get_HWND(&h)))
+                        listed.insert(reinterpret_cast<HWND>(h));
+                }
+                for (auto it = attached.begin(); it != attached.end();) {
+                    if (!listed.count(it->first) || !IsWindow(it->first)) {
                         it->second.cp->Unadvise(it->second.cookie);
                         it = attached.erase(it);
                     } else {
                         ++it;
                     }
                 }
-                long count = 0;
+                count = 0;
                 windows->get_Count(&count);
                 for (long i = 0; i < count; ++i) {
                     VARIANT v;
@@ -394,10 +419,32 @@ DWORD WINAPI WatchThread(void*) {
             if (SUCCEEDED(windows.As(&cpc)) && SUCCEEDED(cpc->FindConnectionPoint(DIID_DShellWindowsEvents, &cp))) cp->Advise(sink, &cookie);
             sink->Release();
             attachAll();
+            // When the shell exits (the taskbar goes away: "Exit Explorer", a
+            // restart, sign-out) the watcher lets go of everything and ends, so
+            // Explorer can close its windows and save them for next time.
+            const UINT_PTR timer = SetTimer(nullptr, 0, 500, nullptr);
+            bool sawTray = FindWindowW(L"Shell_TrayWnd", nullptr) != nullptr;
             MSG msg;
-            while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+            while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                if (!msg.hwnd && msg.message == kMsgDetach) {
+                    detach(reinterpret_cast<HWND>(msg.lParam));
+                    continue;
+                }
+                if (!msg.hwnd && msg.message == WM_TIMER && msg.wParam == timer) {
+                    const bool tray = FindWindowW(L"Shell_TrayWnd", nullptr) != nullptr;
+                    if (sawTray && !tray) break;
+                    sawTray = sawTray || tray;
+                    continue;
+                }
+                DispatchMessageW(&msg);
+            }
+            KillTimer(nullptr, timer);
             if (cp && cookie) cp->Unadvise(cookie);
             for (auto& [h, a] : attached) a.cp->Unadvise(a.cookie);
+            attached.clear();
+            std::lock_guard<std::mutex> g(g_lock);
+            for (auto& [tid, h] : g_hooks) UnhookWindowsHookEx(h);
+            g_hooks.clear();
         }
     }
     CoUninitialize();
