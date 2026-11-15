@@ -216,14 +216,17 @@ int WinnerTest(const wchar_t* dllPath, const wchar_t* archive, const wchar_t* in
             }
         }
         wprintf(L"%s: %s\n", Name(folder, it).c_str(), items.c_str());
-        CMINVOKECOMMANDINFO ici{sizeof(ici)};
-        ici.lpVerb = MAKEINTRESOURCEA(2);  // Winner > Copy path
-        if (SUCCEEDED(menu->InvokeCommand(&ici)) && OpenClipboard(nullptr)) {
-            if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
-                wprintf(L"  Copy path: %s\n", static_cast<const wchar_t*>(GlobalLock(h)));
-                GlobalUnlock(h);
+        // Winner > Copy path, Copy filename, Copy relative path
+        for (const auto& [cmd, label] : {std::pair<int, const wchar_t*>{2, L"Copy path"}, {6, L"Copy filename"}, {7, L"Copy relative path"}}) {
+            CMINVOKECOMMANDINFO ici{sizeof(ici)};
+            ici.lpVerb = MAKEINTRESOURCEA(cmd);
+            if (SUCCEEDED(menu->InvokeCommand(&ici)) && OpenClipboard(nullptr)) {
+                if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+                    wprintf(L"  %s: %s\n", label, static_cast<const wchar_t*>(GlobalLock(h)));
+                    GlobalUnlock(h);
+                }
+                CloseClipboard();
             }
-            CloseClipboard();
         }
         DestroyMenu(m);
         menu->Release();

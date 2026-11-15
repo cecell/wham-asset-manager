@@ -937,7 +937,7 @@ void SelectWhenShown(IShellBrowser* browser, const std::wstring& folder, const s
 
 // ---- The right-click menu: Open and Copy ----
 
-enum { kCmdOpen, kCmdCopy, kCmdWinnerCopy, kCmdWinnerGoTo, kCmdWinnerWindow, kCmdWinnerMenu, kCmdCount };
+enum { kCmdOpen, kCmdCopy, kCmdWinnerCopy, kCmdWinnerGoTo, kCmdWinnerWindow, kCmdWinnerMenu, kCmdCopyName, kCmdCopyRelPath, kCmdCount };
 
 class Menu final : public IContextMenu, public IObjectWithSite {
 public:
@@ -984,7 +984,9 @@ public:
         SetMenuDefaultItem(menu, first + kCmdOpen, FALSE);
         if (flags & CMF_DEFAULTONLY) return MAKE_HRESULT(SEVERITY_SUCCESS, 0, kCmdOpen + 1);
         InsertMenuW(menu, index + 1, MF_BYPOSITION | MF_STRING, first + kCmdCopy, L"&Copy");
-        AddWinnerMenu(menu, index + 2, first);
+        InsertMenuW(menu, index + 2, MF_BYPOSITION | MF_STRING, first + kCmdCopyName, L"Copy file&name");
+        InsertMenuW(menu, index + 3, MF_BYPOSITION | MF_STRING, first + kCmdCopyRelPath, L"Copy &relative path");
+        AddWinnerMenu(menu, index + 4, first);
         return MAKE_HRESULT(SEVERITY_SUCCESS, 0, kCmdCount);
     }
 
@@ -1005,12 +1007,19 @@ public:
                 }
             }
             if (command == kCmdCopy) return Copy();
+            if (command == kCmdCopyName || command == kCmdCopyRelPath) return CopyNames(info->hwnd, command == kCmdCopyRelPath);
             if (command == kCmdOpen) return Open(info->hwnd);
             if (command == kCmdWinnerCopy || command == kCmdWinnerGoTo || command == kCmdWinnerWindow) return Winner(info->hwnd, command);
             return E_INVALIDARG;
         });
     }
     IFACEMETHODIMP GetCommandString(UINT_PTR command, UINT type, UINT*, CHAR* out, UINT size) override {
+        if (command == kCmdCopyName || command == kCmdCopyRelPath) {
+            if (type != GCS_HELPTEXTW) return E_NOTIMPL;  // no canonical verbs
+            return StringCchCopyW(reinterpret_cast<LPWSTR>(out), size,
+                                  command == kCmdCopyName ? L"Copies the file names, one per line."
+                                                          : L"Copies the paths inside the archive (relative to Data), one per line.");
+        }
         if (command == kCmdWinnerCopy || command == kCmdWinnerGoTo || command == kCmdWinnerWindow) {
             if (type != GCS_HELPTEXTW) return E_NOTIMPL;  // no canonical verbs
             const wchar_t* help = command == kCmdWinnerCopy   ? L"Copies the path of the copy the game loads."
@@ -1110,6 +1119,20 @@ private:
         if (SUCCEEDED(hr)) SelectWhenShown(browser, parent, name);
         browser->Release();
         return hr;
+    }
+
+    // The selected entries' names, or their paths inside the archive (the path
+    // relative to the Data folder), one per line.
+    HRESULT CopyNames(HWND hwnd, bool relative) {
+        const ArchivePtr& archive = folder_->GetArchive();
+        std::wstring text;
+        for (int node : nodes_) {
+            std::wstring rel = archive->RelativePath(node);
+            const size_t slash = rel.find_last_of(L'\\');
+            if (!text.empty()) text += L"\r\n";
+            text += relative || slash == std::wstring::npos ? rel : rel.substr(slash + 1);
+        }
+        return text.empty() ? E_FAIL : CopyText(hwnd, text);
     }
 
     HRESULT Copy() {
