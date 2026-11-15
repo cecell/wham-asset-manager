@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "auto_columns.h"
 #include "restart_explorer.h"
 #include "context_menu.h"
 #include "debug_log.h"
@@ -76,6 +77,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
+    static bool autoStarted = false;  // checked until it starts (Explorer only; it asks the settings file)
+    if (!autoStarted && pse::AutoColumnsEnabled()) {
+        pse::StartAutoColumns();
+        autoStarted = true;
+    }
     pse::DebugLog(L"DllGetClassObject menu=%d props=%d", clsid == pse::kClsidContextMenu,
                  clsid == pse::kClsidPropertyHandler || clsid == pse::kClsidAssetPropertyHandler ||
                  clsid == pse::kClsidDdsPropertyHandler);
@@ -184,3 +190,8 @@ extern "C" int __stdcall PseFolderViewNameSnapshot(const wchar_t* png) {
 }
 extern "C" int __stdcall PseReportSnapshot(const wchar_t* title, int status, const wchar_t* text, const wchar_t* png) { return pse::RunReportWindow(title, status, text, png); }
 extern "C" int __stdcall PseDependentsSnapshot(const wchar_t* plugin, const wchar_t* png) { return pse::RunDependentsWindow(plugin, png); }
+extern "C" int __stdcall PseColumnChooserSnapshot(const wchar_t* filter, const wchar_t* png) {
+    std::wstring checked;
+    pse::RunColumnChooser(nullptr, nullptr, png, filter, &checked);
+    return 0;
+}

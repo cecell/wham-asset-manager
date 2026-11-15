@@ -4,6 +4,8 @@
 
 #include <windows.h>
 
+#include <shobjidl.h>
+
 #include "folder_views.h"
 
 #include <string>
@@ -33,6 +35,15 @@ int RunDependentsWindow(const std::wstring& path, const std::wstring& png);
 // Runs the hash dialog on this thread. With png set, it plays `script` (steps
 // like "copy:0" and "compare:abc", separated by |), saves a picture, and closes.
 int RunHashWindow(const std::wstring& path, const std::wstring& png, const std::wstring& script);
+
+// "Choose WHAM columns": a checkbox list of WHAM's columns with a file-type
+// filter, Move up / down, Show all / Hide all, Save as preset. Modal to
+// `owner`'s window, on this thread (the Explorer window's own thread, where its
+// view can be changed). OK applies the checked columns to `view` after
+// Explorer's own columns. True when it changed the view. With png set (tests),
+// saves a picture and closes; `filter` picks the type shown first.
+bool RunColumnChooser(HWND owner, IShellView* view, const std::wstring& png = L"", const std::wstring& filter = L"",
+                      std::wstring* checked = nullptr);
 
 // Runs the test report window on this thread.
 int RunReportWindow(const std::wstring& title, int status, const std::wstring& text, const std::wstring& png);

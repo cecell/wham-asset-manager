@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "context_menu.h"
+#include "auto_columns.h"
 #include "folder_views.h"
 #include "tool_windows.h"
 
@@ -83,7 +84,7 @@ public:
         if (!sub) return E_OUTOFMEMORY;
         try {
             views_ = LoadFolderViews();
-            const UINT room = (last - first) / 3;
+            const UINT room = (last - first - kExtraCount) / 3;
             if (views_.size() > (std::min)(kMaxViews, room)) views_.resize((std::min)(kMaxViews, room));
             const UINT count = static_cast<UINT>(views_.size());
             AppendMenuW(sub, MF_STRING, first, L"Save current view as...");
@@ -103,8 +104,15 @@ public:
                 if (GetMenuItemCount(remove) > 0) AppendMenuW(sub, MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(remove), L"Remove");
                 else DestroyMenu(remove);
             }
+            // After the views: the column dialog and auto columns.
+            const UINT extra = first + 1 + 3 * count;
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(sub, MF_STRING, extra + kChooseColumns, L"Choose WHAM columns...");
+            const bool autoOn = AutoColumnsEnabled();
+            AppendMenuW(sub, MF_STRING | (autoOn ? MF_CHECKED : 0), extra + kAutoColumns, L"Auto columns");
+            if (autoOn && IsFolderManual(root_)) AppendMenuW(sub, MF_STRING, extra + kResetAuto, L"Reset this folder to auto columns");
             InsertMenuW(menu, index, MF_BYPOSITION | MF_POPUP | MF_STRING, reinterpret_cast<UINT_PTR>(sub), kTitle);
-            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 1 + 3 * count);
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 1 + 3 * count + kExtraCount);
         } catch (...) {
             DestroyMenu(sub);
             return E_OUTOFMEMORY;
@@ -116,8 +124,30 @@ public:
         if (HIWORD(info->lpVerb)) return E_INVALIDARG;
         const UINT command = LOWORD(info->lpVerb);
         const UINT count = static_cast<UINT>(views_.size());
-        if (command > 3 * count) return E_INVALIDARG;
+        if (command >= 1 + 3 * count + kExtraCount) return E_INVALIDARG;
         try {
+            if (command >= 1 + 3 * count) {
+                const UINT which = command - 1 - 3 * count;
+                if (which == kAutoColumns) {
+                    const bool on = !AutoColumnsEnabled();
+                    SetAutoColumnsEnabled(on);
+                    if (on) ApplyAutoHere();
+                    return S_OK;
+                }
+                if (which == kResetAuto) {
+                    ResetFolderToAuto(root_);
+                    ApplyAutoHere();
+                    return S_OK;
+                }
+                ComPtr<IShellBrowser> browser;
+                ComPtr<IShellView> view;
+                if (!site_ || FAILED(IUnknown_QueryService(site_.Get(), SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) || FAILED(browser->QueryActiveShellView(&view))) {
+                    ShowMessageAsync(kTitle, L"This window's view couldn't be reached.");
+                    return S_OK;
+                }
+                if (RunColumnChooser(info->hwnd, view.Get())) MarkFolderManual(root_);
+                return S_OK;
+            }
             if (command && command > 2 * count) {
                 RemoveFolderViewAsync(views_[command - 1 - 2 * count].name);
                 return S_OK;
@@ -141,6 +171,7 @@ public:
                 ShowMessageAsync(kTitle, L"The view couldn't be applied to this folder.");
                 return S_OK;
             }
+            MarkFolderManual(root_);  // chosen by hand: auto columns leave it alone
             if (below) WalkSubfolders(browser.Get(), state);
             return S_OK;
         } catch (...) {
@@ -151,6 +182,13 @@ public:
     IFACEMETHODIMP GetCommandString(UINT_PTR, UINT, UINT*, CHAR*, UINT) override { return E_NOTIMPL; }
 
 private:
+    enum : UINT { kChooseColumns, kAutoColumns, kResetAuto, kExtraCount };
+
+    void ApplyAutoHere() {
+        ComPtr<IShellBrowser> browser;
+        if (site_ && SUCCEEDED(IUnknown_QueryService(site_.Get(), SID_STopLevelBrowser, IID_PPV_ARGS(&browser)))) ApplyAutoColumnsNow(browser.Get());
+    }
+
     ~FolderViewsMenu() { InterlockedDecrement(&g_dllRefs); }
 
     void WalkSubfolders(IShellBrowser* browser, const FolderViewState& state) {

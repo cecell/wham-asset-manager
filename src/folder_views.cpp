@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "auto_columns.h"
 #include "work_budget.h"
 
 namespace pse {
@@ -223,6 +224,7 @@ public:
         RegisterClassExW(&wc);
         hwnd_ = CreateWindowExW(0, kWalkClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, this);
         if (!hwnd_) return false;
+        SuspendAutoColumns(true);
         scan_ = std::thread([this] { Scan(); });
         return true;
     }
@@ -233,6 +235,8 @@ private:
 public:
     ~Walker() {
         if (scan_.joinable()) scan_.join();
+        MarkFoldersManual(done_);
+        SuspendAutoColumns(false);
         UnregisterClassW(kWalkClass, ThisModule());
         if (callbacks_.done) callbacks_.done();
     }
@@ -310,6 +314,7 @@ private:
             const std::wstring current = FolderOfView(browser_.Get(), view);
             if (SameFolder(current, folders_[next_])) {
                 if (FAILED(ApplyFolderView(view.Get(), state_))) ++failed_;
+                else done_.push_back(folders_[next_]);
                 from_ = folders_[next_];
                 ++next_;
                 waiting_ = false;
@@ -331,6 +336,7 @@ private:
 
     ComPtr<IShellBrowser> browser_;
     std::wstring root_, from_;
+    std::vector<std::wstring> done_;  // folders it set: auto columns leave them alone
     FolderViewState state_;
     FolderViewWalkCallbacks callbacks_;
     std::vector<std::wstring> folders_;

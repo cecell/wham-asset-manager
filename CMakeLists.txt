@@ -90,6 +90,7 @@ add_library(psetools STATIC
     src/bsa_tools.cpp
     src/papyrus_tools.cpp
     src/folder_views.cpp
+    src/auto_columns.cpp
     src/plugin_tools.cpp
     src/asset_facts.cpp
     src/disk_cache.cpp

@@ -11,3 +11,4 @@ EXPORTS
     PseReportSnapshot
     PseFolderViewNameSnapshot
     PseDependentsSnapshot
+    PseColumnChooserSnapshot

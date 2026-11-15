@@ -31,6 +31,7 @@
 #include <propvarutil.h>
 #include "plugin_tools.h"
 #include "folder_views.h"
+#include "auto_columns.h"
 #include <exdisp.h>
 #include <shlguid.h>
 #include <wrl/client.h>
@@ -328,6 +329,13 @@ int DependentsWindowShot(const wchar_t* dllPath, const wchar_t* plugin, const wc
     return run ? run(plugin, png) : 2;
 }
 
+// --columns <dll> <filter> <png>: the Choose WHAM columns dialog (no window to change), saved as a picture.
+int ColumnChooserShot(const wchar_t* dllPath, const wchar_t* filter, const wchar_t* png) {
+    HMODULE dll = LoadLibraryW(dllPath);
+    auto run = dll ? reinterpret_cast<int(__stdcall*)(const wchar_t*, const wchar_t*)>(GetProcAddress(dll, "PseColumnChooserSnapshot")) : nullptr;
+    return run ? run(filter, png) : 2;
+}
+
 int ReportWindow(const wchar_t* dllPath, const wchar_t* archive, const wchar_t* png) {
     HMODULE dll = LoadLibraryW(dllPath);
     auto run = dll ? reinterpret_cast<int(__stdcall*)(const wchar_t*, int, const wchar_t*, const wchar_t*)>(GetProcAddress(dll, "PseReportSnapshot")) : nullptr;
@@ -568,7 +576,7 @@ int Run(const std::wstring& root) {
             after = pse::LoadFolderViews();
             matches = 0; cols = 0; shippedStill = false;
             for (auto& v : after) if (!_wcsicmp(v.name.c_str(), L"plugins")) { ++matches; cols = v.columns.size(); shippedStill = v.shipped; }
-            Expect(after.size() == 7 && matches == 1 && cols == 17 && shippedStill, L"removing it brings the preset back");
+            Expect(after.size() == 7 && matches == 1 && cols == 19 && shippedStill, L"removing it brings the preset back");
             win->Quit();
             Pump(800);
         }
@@ -591,6 +599,73 @@ int Run(const std::wstring& root) {
     Expect(pse::StoreFolderView(stored) && Saved().size() == 1, L"saving after damage works");
     Expect(GetFileAttributesW((pse::FolderViewsFilePath() + L".damaged").c_str()) != INVALID_FILE_ATTRIBUTES, L"the damaged file is kept aside");
     wprintf(L"failures=%d\n", g_fail);
+    return g_fail ? 1 : 0;
+}
+
+// --autocolumns <empty test root>: auto columns on real Explorer windows, in folders it makes under the root.
+int AutoRun(const std::wstring& root) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const std::wstring tex = root + L"\\Data\\textures\\armor", mesh = root + L"\\Data\\meshes\\armor", anim = root + L"\\Data\\meshes\\actors\\animations",
+                       store = root + L"\\auto_columns.json";
+    for (const auto& d : {tex, mesh, anim}) SHCreateDirectoryExW(nullptr, d.c_str(), nullptr);
+    for (const auto& f : {tex + L"\\a.dds", mesh + L"\\a.nif"}) { HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); CloseHandle(h); }
+    SetEnvironmentVariableW(L"PSE_AUTO_COLUMNS_FILE", store.c_str());
+    DeleteFileW(store.c_str());
+    pse::SetAutoColumnsEnabled(true);
+    Expect(pse::AutoPresetFor(tex) == L"Textures", L"textures\\armor -> Textures");
+    Expect(pse::AutoPresetFor(anim) == L"Animations", L"meshes\\actors\\animations -> Animations (deepest wins)");
+    Expect(pse::AutoPresetFor(root + L"\\Data").empty(), L"a Data folder without plugins -> no preset");
+    auto web = Open(tex);
+    Expect(web != nullptr, L"Explorer window on textures\\armor");
+    if (!web) return 1;
+    ComPtr<IShellBrowser> browser;
+    ComPtr<IShellView> view;
+    Expect(ViewOf(web.Get(), browser, view), L"its view can be reached");
+    auto has = [&](const wchar_t* name) {
+        ComPtr<IColumnManager> cm;
+        PROPERTYKEY want{};
+        PSGetPropertyKeyFromName(name, &want);
+        UINT n = 0;
+        if (FAILED(view.As(&cm)) || FAILED(cm->GetColumnCount(CM_ENUM_VISIBLE, &n))) return false;
+        std::vector<PROPERTYKEY> keys(n);
+        cm->GetColumns(CM_ENUM_VISIBLE, keys.data(), n);
+        for (auto& k : keys) if (IsEqualPropertyKey(k, want)) return true;
+        return false;
+    };
+    std::wstring note = pse::ApplyAutoColumnsNow(browser.Get());
+    wprintf(L"  first visit: %ls\n", note.c_str());
+    Expect(note == L"applied Textures", L"first visit applies Textures");
+    browser->QueryActiveShellView(&view);
+    Expect(has(L"Cecell.PluginShellExtension.TexFormat"), L"the Format column is shown");
+    note = pse::ApplyAutoColumnsNow(browser.Get());
+    Expect(note == L"already Textures", (L"second visit leaves it: " + note).c_str());
+    {   // the user changes the columns by hand
+        ComPtr<IColumnManager> cm;
+        PROPERTYKEY name{};
+        PSGetPropertyKeyFromName(L"System.ItemNameDisplay", &name);
+        if (SUCCEEDED(view.As(&cm))) cm->SetColumns(&name, 1);
+    }
+    note = pse::ApplyAutoColumnsNow(browser.Get());
+    Expect(note == L"changed by hand" && pse::IsFolderManual(tex), (L"a hand change makes it the user's: " + note).c_str());
+    note = pse::ApplyAutoColumnsNow(browser.Get());
+    Expect(note == L"manual", (L"and it stays theirs: " + note).c_str());
+    pse::ResetFolderToAuto(tex);
+    note = pse::ApplyAutoColumnsNow(browser.Get());
+    Expect(note == L"applied Textures", (L"Reset to auto applies again: " + note).c_str());
+    web->Quit();
+    auto web2 = Open(mesh);
+    if (web2 && ViewOf(web2.Get(), browser, view)) {
+        note = pse::ApplyAutoColumnsNow(browser.Get());
+        Expect(note == L"applied Meshes", (L"meshes\\armor -> " + note).c_str());
+        browser->QueryActiveShellView(&view);
+        Expect(has(L"Cecell.PluginShellExtension.NifTriangles"), L"the Triangles column is shown");
+        web2->Quit();
+    } else {
+        Expect(false, L"Explorer window on meshes\\armor");
+    }
+    pse::SetAutoColumnsEnabled(false);
+    note = L"";
+    wprintf(L"%d failed\n", g_fail);
     return g_fail ? 1 : 0;
 }
 }  // namespace views
@@ -1259,11 +1334,30 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && !wcscmp(argv[1], L"--upgrade")) return HeaderUpgrade(argv[2]);
     if (argc == 4 && !wcscmp(argv[1], L"--pluginmenu")) return PluginMenu(argv[2], argv[3]);
     if (argc == 6 && !wcscmp(argv[1], L"--bsadrop")) return BsaDrop(argv[2], argv[3], argv[4], _wtoi(argv[5]));
+    // These two write settings files: they only run on a test folder under %TEMP%,
+    // with their own folder_views.json / auto_columns.json in it, never the user's.
+    if (argc == 3 && (!wcscmp(argv[1], L"--folderviews") || !wcscmp(argv[1], L"--autocolumns"))) {
+        wchar_t temp[MAX_PATH] = {}, full[MAX_PATH * 2] = {};
+        GetTempPathW(MAX_PATH, temp);
+        GetFullPathNameW(argv[2], ARRAYSIZE(full), full, nullptr);
+        wchar_t longTemp[MAX_PATH * 2] = {}, longFull[MAX_PATH * 2] = {};
+        GetLongPathNameW(temp, longTemp, ARRAYSIZE(longTemp));
+        GetLongPathNameW(full, longFull, ARRAYSIZE(longFull));
+        if (_wcsnicmp(longFull, longTemp, wcslen(longTemp)) != 0) {
+            fwprintf(stderr, L"refused: the test folder must be under %ls (it writes settings files there)\n", longTemp);
+            return 2;
+        }
+        const std::wstring root = longFull;
+        SetEnvironmentVariableW(L"PSE_FOLDER_VIEWS_FILE", (root + L"\\folder_views.json").c_str());
+        SetEnvironmentVariableW(L"PSE_AUTO_COLUMNS_FILE", (root + L"\\auto_columns.json").c_str());
+    }
     if (argc == 3 && !wcscmp(argv[1], L"--folderviews")) return views::Run(argv[2]);
+    if (argc == 3 && !wcscmp(argv[1], L"--autocolumns")) return views::AutoRun(argv[2]);
     if (argc == 4 && !wcscmp(argv[1], L"--namewindow")) return NameWindowShot(argv[2], argv[3]);
     if (argc == 4 && !wcscmp(argv[1], L"--papyrus")) return PapyrusList(argv[2], argv[3]);
     if (argc == 5 && !wcscmp(argv[1], L"--propswindow")) return PropsWindow(argv[2], argv[3], argv[4]);
     if (argc == 5 && !wcscmp(argv[1], L"--dependents")) return DependentsWindowShot(argv[2], argv[3], argv[4]);
+    if (argc == 5 && !wcscmp(argv[1], L"--columns")) return ColumnChooserShot(argv[2], argv[3], argv[4]);
     if (argc == 5 && !wcscmp(argv[1], L"--reportwindow")) return ReportWindow(argv[2], argv[3], argv[4]);
     OleInitialize(nullptr);
     int rc = 2;

@@ -10,8 +10,10 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <strsafe.h>
+#include <propsys.h>
 #include <uxtheme.h>
 #include <windowsx.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -28,6 +30,8 @@ extern HINSTANCE g_hInst;
 
 namespace pse {
 namespace {
+
+using Microsoft::WRL::ComPtr;
 
 constexpr UINT WM_APP_HASH = WM_APP + 2;
 constexpr int IDC_INPUT = 201, IDC_COMPARE = 202, IDC_CLOSE = 203, IDC_REPORT = 204;
@@ -950,6 +954,449 @@ private:
     Theme theme_ = CurrentTheme();
 };
 
+// ---- Choose WHAM columns: Explorer's Choose Details, for WHAM's columns only ----
+
+constexpr wchar_t kChooserClass[] = L"PluginShellExtensionColumns";
+constexpr int IDC_FILTER = 210, IDC_COLS = 211, IDC_UP = 212, IDC_DOWN = 213, IDC_ALL = 214, IDC_NONE = 215, IDC_SAVEPRESET = 216;
+
+// Every WHAM column the dialog offers: property name (after the prefix), its
+// label when the property system can't give one, and the file type it belongs to.
+struct ChooserColumnDef {
+    const wchar_t* name;
+    const wchar_t* label;
+    const wchar_t* group;
+};
+const ChooserColumnDef kChooserColumns[] = {
+    {L"Flags", L"Flags", L"Plugins"}, {L"Light", L"Is Light", L"Plugins"}, {L"ESLable", L"ESLable", L"Plugins"},
+    {L"ESLNote", L"ESLable note", L"Plugins"}, {L"Dirty", L"Dirty", L"Plugins"}, {L"ItmCount", L"#ITM", L"Plugins"},
+    {L"FormCount", L"#Master Forms", L"Plugins"}, {L"RecordCount", L"#Records", L"Plugins"}, {L"MasterCount", L"#Masters", L"Plugins"},
+    {L"Masters", L"Masters", L"Plugins"}, {L"MasterStatus", L"MasterStatus", L"Plugins"}, {L"DependentCount", L"#Dependents", L"Plugins"},
+    {L"DeletedCount", L"#Deleted", L"Plugins"}, {L"DeletedNavmeshes", L"Del NAVM", L"Plugins"}, {L"HeaderVersion", L"Header Ver", L"Plugins"},
+    {L"FormVersion", L"Form Ver", L"Plugins"},
+    {L"BsaGame", L"BSA Game", L"Archives"}, {L"BsaVersion", L"BSA Ver", L"Archives"}, {L"BsaFiles", L"Files", L"Archives"},
+    {L"BsaFolders", L"Folders", L"Archives"}, {L"BsaContains", L"Contains", L"Archives"}, {L"BsaCompression", L"Compression", L"Archives"},
+    {L"BsaUnpacked", L"Unpacked", L"Archives"}, {L"BsaHasPlugin", L"Has Plugin", L"Archives"},
+    {L"NifGame", L"Game", L"Meshes"}, {L"NifVersion", L"NIF Ver", L"Meshes"}, {L"NifBlocks", L"Blocks", L"Meshes"}, {L"NifStrips", L"Strips", L"Meshes"},
+    {L"NifShapes", L"Shapes", L"Meshes"}, {L"NifVertices", L"Vertices", L"Meshes"}, {L"NifTriangles", L"Triangles", L"Meshes"},
+    {L"NifTextures", L"Textures", L"Meshes"},
+    {L"TexFormat", L"Format", L"Textures"}, {L"Mipmaps", L"Mipmaps", L"Textures"}, {L"TexSrgb", L"sRGB", L"Textures"},
+    {L"TexAlpha", L"Alpha", L"Textures"}, {L"TexCubemap", L"Cubemap", L"Textures"},
+    {L"AudioFormat", L"Audio Fmt", L"Audio"}, {L"SampleRate", L"Sample Rate", L"Audio"}, {L"Channels", L"Channels", L"Audio"},
+    {L"FuzVersion", L"Fuz Ver", L"Audio"}, {L"HasLip", L"Has Lip", L"Audio"}, {L"LipVersion", L"Lip Ver", L"Audio"}, {L"LipUnits", L"Units", L"Audio"},
+    {L"HkxContent", L"Content", L"Animations"}, {L"HkxGame", L"Anim Game", L"Animations"}, {L"HkxFrames", L"Frames", L"Animations"},
+    {L"HkxTracks", L"Tracks", L"Animations"}, {L"HkxAnnotations", L"Annotations", L"Animations"}, {L"HkxEvents", L"Events", L"Animations"},
+    {L"HkxVariables", L"Variables", L"Animations"}, {L"HkxClips", L"Clips", L"Animations"}, {L"HkxAnimations", L"Anim List", L"Animations"},
+    {L"ScriptName", L"Script", L"Scripts"}, {L"ScriptCompiled", L"Compiled", L"Scripts"}, {L"ScriptExtends", L"Extends", L"Scripts"},
+    {L"ScriptFunctions", L"Functions", L"Scripts"}, {L"ScriptProperties", L"Properties", L"Scripts"}, {L"ScriptStates", L"States", L"Scripts"},
+    {L"ScriptFlags", L"Script Flags", L"Scripts"}, {L"ScriptCompiledState", L"Compiled?", L"Scripts"},
+};
+const wchar_t* const kChooserGroups[] = {L"All types", L"Plugins", L"Archives", L"Meshes", L"Textures", L"Audio", L"Animations", L"Scripts"};
+constexpr wchar_t kWhamPrefix[] = L"Cecell.PluginShellExtension.";
+
+struct ChooserItem {
+    PROPERTYKEY key{};
+    std::wstring label, group;
+    bool checked = false;
+};
+
+class ColumnChooser {
+public:
+    ColumnChooser(IShellView* view, std::wstring png, std::wstring filter) : view_(view), png_(std::move(png)), startFilter_(std::move(filter)) {
+        Load();
+    }
+
+    static void Register() {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = &ColumnChooser::StaticProc;
+        wc.hInstance = g_hInst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = kChooserClass;
+        RegisterClassExW(&wc);
+    }
+
+    HWND Create(HWND owner) {
+        return CreateWindowExW(WS_EX_CONTROLPARENT | WS_EX_DLGMODALFRAME, kChooserClass, L"Choose WHAM columns",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0, 100, 100, owner, nullptr, g_hInst, this);
+    }
+
+    bool Done() const { return done_; }
+    bool Applied() const { return applied_; }
+    // Checked columns in order, as text (tests).
+    std::wstring CheckedText() const {
+        std::wstring s;
+        for (const ChooserItem& c : items_)
+            if (c.checked) s += c.label + L" (" + c.group + L")\r\n";
+        return s;
+    }
+
+private:
+    static bool IsWham(const PROPERTYKEY& key) {
+        for (const ChooserColumnDef& d : kChooserColumns) {
+            PROPERTYKEY k;
+            if (SUCCEEDED(PSGetPropertyKeyFromName((std::wstring(kWhamPrefix) + d.name).c_str(), &k)) && IsEqualPropertyKey(k, key)) return true;
+        }
+        return false;
+    }
+
+    // The window's WHAM columns first, in their order and checked; then the rest by type.
+    void Load() {
+        std::vector<ChooserItem> all;
+        for (const ChooserColumnDef& d : kChooserColumns) {
+            ChooserItem it;
+            if (FAILED(PSGetPropertyKeyFromName((std::wstring(kWhamPrefix) + d.name).c_str(), &it.key))) continue;  // not installed
+            it.label = d.label;
+            ComPtr<IPropertyDescription> desc;
+            if (SUCCEEDED(PSGetPropertyDescription(it.key, IID_PPV_ARGS(&desc)))) {
+                wchar_t* name = nullptr;
+                if (SUCCEEDED(desc->GetDisplayName(&name)) && name && *name) it.label = name;
+                CoTaskMemFree(name);
+            }
+            it.group = d.group;
+            all.push_back(it);
+        }
+        ComPtr<IColumnManager> cm;
+        std::vector<PROPERTYKEY> visible;
+        if (view_ && SUCCEEDED(view_->QueryInterface(IID_PPV_ARGS(&cm)))) {
+            UINT n = 0;
+            if (SUCCEEDED(cm->GetColumnCount(CM_ENUM_VISIBLE, &n)) && n) {
+                visible.resize(n);
+                if (FAILED(cm->GetColumns(CM_ENUM_VISIBLE, visible.data(), n))) visible.clear();
+            }
+        }
+        for (const PROPERTYKEY& k : visible)
+            for (ChooserItem& it : all)
+                if (!it.checked && IsEqualPropertyKey(it.key, k)) {
+                    it.checked = true;
+                    items_.push_back(it);
+                }
+        for (const ChooserItem& it : all)
+            if (!it.checked) items_.push_back(it);
+    }
+
+    static LRESULT CALLBACK StaticProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* self = reinterpret_cast<ColumnChooser*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            self = static_cast<ColumnChooser*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            self->hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        return self ? self->Proc(msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    static LRESULT CALLBACK ListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+        if (msg == WM_NOTIFY) {
+            auto* nm = reinterpret_cast<NMHDR*>(lp);
+            if (nm->code == NM_CUSTOMDRAW && nm->hwndFrom == ListView_GetHeader(h)) {
+                auto* cd = reinterpret_cast<NMCUSTOMDRAW*>(lp);
+                if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    SetTextColor(cd->hdc, reinterpret_cast<ColumnChooser*>(ref)->theme_.text);
+                    return CDRF_DODEFAULT;
+                }
+            }
+        }
+        if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, &ColumnChooser::ListProc, 1);
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
+    int S(int v) const { return Scale(v, dpi_); }
+    std::wstring Filter() const {
+        const int i = static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0));
+        return i <= 0 ? L"" : kChooserGroups[i];
+    }
+
+    // Shows the items of the chosen type; lParam = index into items_.
+    void Fill(int selectModel = -1) {
+        filling_ = true;
+        SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(list_);
+        const std::wstring f = Filter();
+        int row = 0, select = -1;
+        for (size_t i = 0; i < items_.size(); ++i) {
+            if (!f.empty() && items_[i].group != f) continue;
+            LVITEMW item{};
+            item.mask = LVIF_TEXT | LVIF_PARAM;
+            item.iItem = row;
+            item.pszText = const_cast<wchar_t*>(items_[i].label.c_str());
+            item.lParam = static_cast<LPARAM>(i);
+            ListView_InsertItem(list_, &item);
+            ListView_SetItemText(list_, row, 1, const_cast<wchar_t*>(items_[i].group.c_str()));
+            ListView_SetCheckState(list_, row, items_[i].checked);
+            if (static_cast<int>(i) == selectModel) select = row;
+            ++row;
+        }
+        if (select >= 0) {
+            ListView_SetItemState(list_, select, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(list_, select, FALSE);
+        }
+        SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
+        filling_ = false;
+        UpdateButtons();
+    }
+
+    int SelectedModel() const {
+        const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+        if (row < 0) return -1;
+        LVITEMW item{};
+        item.mask = LVIF_PARAM;
+        item.iItem = row;
+        ListView_GetItem(list_, &item);
+        return static_cast<int>(item.lParam);
+    }
+
+    // Swaps the selected column with the one shown above / below it.
+    void Move(int dir) {
+        const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+        const int other = row + dir;
+        if (row < 0 || other < 0 || other >= ListView_GetItemCount(list_)) return;
+        LVITEMW a{}, b{};
+        a.mask = b.mask = LVIF_PARAM;
+        a.iItem = row;
+        b.iItem = other;
+        ListView_GetItem(list_, &a);
+        ListView_GetItem(list_, &b);
+        std::swap(items_[a.lParam], items_[b.lParam]);
+        Fill(static_cast<int>(b.lParam));
+    }
+
+    void SetAll(bool on) {
+        const std::wstring f = Filter();
+        for (ChooserItem& it : items_)
+            if (f.empty() || it.group == f) it.checked = on;
+        Fill(SelectedModel());
+    }
+
+    void UpdateButtons() {
+        const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
+        EnableWindow(up_, row > 0);
+        EnableWindow(down_, row >= 0 && row + 1 < ListView_GetItemCount(list_));
+    }
+
+    // Explorer's own columns stay where they are; the checked WHAM columns follow, in this order.
+    bool Apply() {
+        if (!view_) return false;
+        ComPtr<IColumnManager> cm;
+        if (FAILED(view_->QueryInterface(IID_PPV_ARGS(&cm)))) return false;
+        UINT n = 0;
+        std::vector<PROPERTYKEY> visible;
+        if (SUCCEEDED(cm->GetColumnCount(CM_ENUM_VISIBLE, &n)) && n) {
+            visible.resize(n);
+            if (FAILED(cm->GetColumns(CM_ENUM_VISIBLE, visible.data(), n))) return false;
+        }
+        std::vector<PROPERTYKEY> keys;
+        for (const PROPERTYKEY& k : visible)
+            if (!IsWham(k)) keys.push_back(k);
+        for (const ChooserItem& it : items_)
+            if (it.checked) keys.push_back(it.key);
+        if (keys.empty() || FAILED(cm->SetColumns(keys.data(), static_cast<UINT>(keys.size())))) return false;
+        view_->SaveViewState();
+        applied_ = true;
+        return true;
+    }
+
+    void Layout() {
+        RECT rc;
+        GetClientRect(hwnd_, &rc);
+        const int bw = S(110), bh = S(kButtonH), pad = S(kPad);
+        const int right = rc.right - pad;
+        MoveWindow(filter_, pad + S(70), S(52), S(200), S(300), TRUE);
+        const int listTop = S(86), listBottom = rc.bottom - pad - bh - S(12);
+        MoveWindow(list_, pad, listTop, right - bw - S(10) - pad, listBottom - listTop, TRUE);
+        int y = listTop;
+        for (HWND b : {up_, down_, all_, none_}) {
+            MoveWindow(b, right - bw, y, bw, bh, TRUE);
+            y += bh + S(6);
+        }
+        const int by = rc.bottom - pad - bh;
+        MoveWindow(cancel_, right - S(kCompareW), by, S(kCompareW), bh, TRUE);
+        MoveWindow(ok_, right - 2 * S(kCompareW) - S(8), by, S(kCompareW), bh, TRUE);
+        MoveWindow(preset_, pad, by, S(150), bh, TRUE);
+        RECT lr;
+        GetClientRect(list_, &lr);
+        ListView_SetColumnWidth(list_, 0, (std::max)(S(120), static_cast<int>(lr.right) - S(110)));
+        ListView_SetColumnWidth(list_, 1, S(100));
+    }
+
+    LRESULT Proc(UINT msg, WPARAM wp, LPARAM lp) {
+        switch (msg) {
+            case WM_CREATE: {
+                dpi_ = GetDpiForWindow(hwnd_);
+                theme_ = CurrentTheme();
+                font_ = MessageFont(dpi_);
+                LOGFONTW lf{};
+                GetObjectW(font_, sizeof(lf), &lf);
+                lf.lfWeight = FW_SEMIBOLD;
+                lf.lfHeight = MulDiv(lf.lfHeight, 4, 3);
+                bold_ = CreateFontIndirectW(&lf);
+                filter_ = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 10, 10, hwnd_, CtrlId(IDC_FILTER), g_hInst, nullptr);
+                for (const wchar_t* g : kChooserGroups) SendMessageW(filter_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(g));
+                int start = 0;
+                for (int i = 0; i < static_cast<int>(ARRAYSIZE(kChooserGroups)); ++i)
+                    if (!startFilter_.empty() && _wcsicmp(startFilter_.c_str(), kChooserGroups[i]) == 0) start = i;
+                SendMessageW(filter_, CB_SETCURSEL, start, 0);
+                list_ = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_NOSORTHEADER, 0, 0, 10, 10,
+                                        hwnd_, CtrlId(IDC_COLS), g_hInst, nullptr);
+                ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES);
+                LVCOLUMNW col{};
+                col.mask = LVCF_TEXT | LVCF_WIDTH;
+                col.cx = S(260);
+                col.pszText = const_cast<wchar_t*>(L"Column");
+                ListView_InsertColumn(list_, 0, &col);
+                col.cx = S(100);
+                col.pszText = const_cast<wchar_t*>(L"Type");
+                ListView_InsertColumn(list_, 1, &col);
+                auto button = [&](const wchar_t* text, int id, DWORD extra = 0) {
+                    return CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | extra, 0, 0, 10, 10, hwnd_, CtrlId(id), g_hInst, nullptr);
+                };
+                up_ = button(L"Move up", IDC_UP);
+                down_ = button(L"Move down", IDC_DOWN);
+                all_ = button(L"Show all", IDC_ALL);
+                none_ = button(L"Hide all", IDC_NONE);
+                preset_ = button(L"Save as preset...", IDC_SAVEPRESET, view_ ? 0 : WS_DISABLED);
+                ok_ = button(L"OK", IDOK, BS_DEFPUSHBUTTON);
+                cancel_ = button(L"Cancel", IDCANCEL);
+                for (HWND h : {filter_, list_, up_, down_, all_, none_, preset_, ok_, cancel_}) {
+                    SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+                    SetWindowTheme(h, theme_.dark ? (h == filter_ ? L"DarkMode_CFD" : L"DarkMode_Explorer") : L"Explorer", nullptr);
+                }
+                BOOL dark = theme_.dark;
+                DwmSetWindowAttribute(hwnd_, kDwmUseImmersiveDarkMode, &dark, sizeof(dark));
+                if (HWND header = ListView_GetHeader(list_)) SetWindowTheme(header, theme_.dark ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
+                SetWindowSubclass(list_, &ColumnChooser::ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
+                ListView_SetBkColor(list_, theme_.inputBack);
+                ListView_SetTextBkColor(list_, theme_.inputBack);
+                ListView_SetTextColor(list_, theme_.text);
+                CenterOnCursorMonitor(hwnd_, S(560), S(560));
+                Layout();
+                Fill();
+                if (!png_.empty()) PostMessageW(hwnd_, WM_APP_HASH, 0, 0);
+                return 0;
+            }
+            case WM_APP_HASH:
+                RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+                SaveWindowPng(hwnd_, png_, nullptr, nullptr);
+                DestroyWindow(hwnd_);
+                return 0;
+            case WM_NOTIFY: {
+                auto* nm = reinterpret_cast<NMHDR*>(lp);
+                if (nm->idFrom == IDC_COLS && nm->code == LVN_ITEMCHANGED && !filling_) {
+                    auto* lv = reinterpret_cast<NMLISTVIEW*>(lp);
+                    if ((lv->uChanged & LVIF_STATE) && ((lv->uNewState ^ lv->uOldState) & LVIS_STATEIMAGEMASK) && lv->iItem >= 0) {
+                        LVITEMW item{};
+                        item.mask = LVIF_PARAM;
+                        item.iItem = lv->iItem;
+                        ListView_GetItem(list_, &item);
+                        items_[item.lParam].checked = ListView_GetCheckState(list_, lv->iItem) != 0;
+                    }
+                    UpdateButtons();
+                }
+                return 0;
+            }
+            case WM_COMMAND:
+                switch (LOWORD(wp)) {
+                    case IDC_FILTER:
+                        if (HIWORD(wp) == CBN_SELCHANGE) Fill();
+                        break;
+                    case IDC_UP: Move(-1); break;
+                    case IDC_DOWN: Move(1); break;
+                    case IDC_ALL: SetAll(true); break;
+                    case IDC_NONE: SetAll(false); break;
+                    case IDC_SAVEPRESET:
+                        if (Apply()) {
+                            FolderViewState state;
+                            if (SUCCEEDED(CaptureFolderView(view_, state))) SaveFolderViewAsync(std::move(state));
+                        }
+                        break;
+                    case IDOK:
+                        if (view_ && !Apply()) {
+                            MessageBoxW(hwnd_, L"The columns couldn't be changed in this window.", L"Choose WHAM columns", MB_OK | MB_ICONWARNING);
+                            break;
+                        }
+                        DestroyWindow(hwnd_);
+                        break;
+                    case IDCANCEL: DestroyWindow(hwnd_); break;
+                }
+                return 0;
+            case WM_SIZE:
+                Layout();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            case WM_GETMINMAXINFO: {
+                auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
+                mm->ptMinTrackSize = {S(440), S(360)};
+                return 0;
+            }
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLORLISTBOX:
+            case WM_CTLCOLOREDIT: {
+                HDC dc = reinterpret_cast<HDC>(wp);
+                SetTextColor(dc, theme_.text);
+                SetBkColor(dc, theme_.inputBack);
+                if (!brush_) brush_ = CreateSolidBrush(theme_.inputBack);
+                return reinterpret_cast<LRESULT>(brush_);
+            }
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd_, &ps);
+                Paint(dc);
+                EndPaint(hwnd_, &ps);
+                return 0;
+            }
+            case WM_PRINTCLIENT:
+                Paint(reinterpret_cast<HDC>(wp));
+                return 0;
+            case WM_CLOSE:
+                DestroyWindow(hwnd_);
+                return 0;
+            case WM_DESTROY:
+                done_ = true;
+                return 0;
+            case WM_NCDESTROY:
+                for (HFONT f : {font_, bold_})
+                    if (f) DeleteObject(f);
+                if (brush_) DeleteObject(brush_);
+                SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
+                break;
+        }
+        return DefWindowProcW(hwnd_, msg, wp, lp);
+    }
+
+    void Paint(HDC dc) {
+        RECT rc;
+        GetClientRect(hwnd_, &rc);
+        FillBox(dc, rc, theme_.window);
+        SetBkMode(dc, TRANSPARENT);
+        HGDIOBJ old = SelectObject(dc, bold_);
+        SetTextColor(dc, theme_.text);
+        RECT r{S(kPad), S(8), rc.right - S(kPad), S(32)};
+        DrawTextW(dc, L"Choose the WHAM columns for this window", -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(dc, font_);
+        SetTextColor(dc, theme_.faint);
+        RECT r2{S(kPad), S(30), rc.right - S(kPad), S(48)};
+        DrawTextW(dc, L"Explorer's own columns stay as they are. Checked columns show, in this order.", -1, &r2,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SetTextColor(dc, theme_.text);
+        RECT r3{S(kPad), S(52), S(kPad) + S(66), S(52) + S(24)};
+        DrawTextW(dc, L"Show:", -1, &r3, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, old);
+    }
+
+    IShellView* view_;
+    std::wstring png_, startFilter_;
+    std::vector<ChooserItem> items_;
+    HWND hwnd_ = nullptr, filter_ = nullptr, list_ = nullptr, up_ = nullptr, down_ = nullptr, all_ = nullptr, none_ = nullptr, preset_ = nullptr,
+         ok_ = nullptr, cancel_ = nullptr;
+    UINT dpi_ = 96;
+    HFONT font_ = nullptr, bold_ = nullptr;
+    HBRUSH brush_ = nullptr;
+    Theme theme_ = CurrentTheme();
+    bool done_ = false, applied_ = false, filling_ = false;
+};
+
+int g_chooserUsers = 0;
+
 int g_dependentsUsers = 0;
 
 struct DependentsArgs {
@@ -1477,6 +1924,54 @@ int RunDependentsWindow(const std::wstring& path, const std::wstring& png) {
     }
     if (SUCCEEDED(co)) CoUninitialize();
     return result;
+}
+
+bool RunColumnChooser(HWND owner, IShellView* view, const std::wstring& png, const std::wstring& filter, std::wstring* checked) {
+    HRESULT co = png.empty() ? E_FAIL : CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool applied = false;
+    {
+        ActivationContext act;
+        INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES};
+        InitCommonControlsEx(&icc);
+        {
+            std::lock_guard<std::mutex> g(g_classLock);
+            if (g_chooserUsers++ == 0) ColumnChooser::Register();
+        }
+        {
+            HWND top = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
+            ColumnChooser window(view, png, filter);
+            if (HWND hwnd = window.Create(top)) {
+                // Modal to its Explorer window only, like Explorer's own Choose Details.
+                const bool disable = top && IsWindowEnabled(top);
+                if (disable) EnableWindow(top, FALSE);
+                ShowWindow(hwnd, png.empty() ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+                if (png.empty()) SetForegroundWindow(hwnd);
+                MSG msg;
+                while (!window.Done()) {
+                    const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+                    if (got <= 0) {
+                        if (got == 0) PostQuitMessage(static_cast<int>(msg.wParam));  // the thread's own quit: pass it on
+                        break;
+                    }
+                    if (!IsWindow(hwnd) || !IsDialogMessageW(hwnd, &msg)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                if (IsWindow(hwnd)) DestroyWindow(hwnd);
+                if (disable) {
+                    EnableWindow(top, TRUE);
+                    SetActiveWindow(top);
+                }
+            }
+            applied = window.Applied();
+            if (checked) *checked = window.CheckedText();
+        }
+        std::lock_guard<std::mutex> g(g_classLock);
+        if (--g_chooserUsers == 0) UnregisterClassW(kChooserClass, g_hInst);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return applied;
 }
 
 void ShowDependentsWindowAsync(const std::wstring& path) {
