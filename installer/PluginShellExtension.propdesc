@@ -141,6 +141,20 @@
       <displayInfo displayType="String" defaultColumnWidth="10"/>
     </propertyDescription>
 
+    <propertyDescription name="Cecell.PluginShellExtension.Mod" formatID="{14E162A8-957D-4913-B1DD-86439C188DC6}" propID="64">
+      <searchInfo inInvertedIndex="false" isColumn="true" columnIndexType="OnDisk" maxSize="260"/>
+      <labelInfo label="Mod"/>
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true"/>
+      <displayInfo displayType="String" defaultColumnWidth="24"/>
+    </propertyDescription>
+
+    <propertyDescription name="Cecell.PluginShellExtension.Deployed" formatID="{14E162A8-957D-4913-B1DD-86439C188DC6}" propID="65">
+      <searchInfo inInvertedIndex="false" isColumn="true" columnIndexType="OnDisk" maxSize="260"/>
+      <labelInfo label="Deployed"/>
+      <typeInfo type="String" isInnate="true" isViewable="true" isQueryable="true"/>
+      <displayInfo displayType="String" defaultColumnWidth="20"/>
+    </propertyDescription>
+
     <propertyDescription name="Cecell.PluginShellExtension.Dirty" formatID="{14E162A8-957D-4913-B1DD-86439C188DC6}" propID="15">
       <searchInfo inInvertedIndex="false" isColumn="true" columnIndexType="OnDisk" maxSize="32"/>
       <labelInfo label="Dirty"/>

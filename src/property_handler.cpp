@@ -1,4 +1,5 @@
 #include "property_handler.h"
+#include "staging_info.h"
 
 #include <propsys.h>
 #include <propvarutil.h>
@@ -31,7 +32,7 @@ namespace {
 
 constexpr DWORD kPids[] = {kPidHeaderVersion, kPidRecordCount, kPidFlags, kPidLight,
                            kPidMasterCount,   kPidDeletedCount, kPidEslable, kPidMasters, kPidEslNote,
-                           kPidFormVersion, kPidDeletedNavm, kPidFormCount, kPidItm, kPidDirty, kPidTipStatus, kPidDependentCount, kPidMasterStatus};
+                           kPidFormVersion, kPidDeletedNavm, kPidFormCount, kPidItm, kPidDirty, kPidTipStatus, kPidDependentCount, kPidMasterStatus, kPidMod, kPidDeployed};
 
 // The two values that need the full record walk, cached per process so a
 // folder refresh does not rescan every plugin. Keyed by file name, size and
@@ -437,6 +438,14 @@ public:
                 return InitPropVariantFromUInt32(static_cast<ULONG>(header_.masters.size()), pv);
             case kPidDependentCount:
                 return InitPropVariantFromUInt32(static_cast<ULONG>(DependentCount(path_)), pv);
+            case kPidMod: {
+                const std::wstring mod = ModOf(path_);
+                return mod.empty() ? S_OK : InitPropVariantFromString(mod.c_str(), pv);
+            }
+            case kPidDeployed: {
+                const std::wstring d = DeployedOf(path_);
+                return d.empty() ? S_OK : InitPropVariantFromString(d.c_str(), pv);
+            }
             case kPidMasterStatus: {
                 const std::wstring status = MasterStatusText(MasterStateOf(path_, header_.masters), header_.masters.size());
                 return status.empty() ? S_OK : InitPropVariantFromString(status.c_str(), pv);

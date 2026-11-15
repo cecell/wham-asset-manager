@@ -1,4 +1,5 @@
 #include "asset_property_handler.h"
+#include "staging_info.h"
 
 #include <propsys.h>
 #include <propvarutil.h>
@@ -104,6 +105,7 @@ public:
         try {
             if (dds_) LoadDds(stream, mode);
             else Load(stream);
+            AddStaging(stream);
         } catch (const std::bad_alloc&) {
             Clear();
         }
@@ -165,6 +167,18 @@ private:
     void AddUInt64(REFPROPERTYKEY key, uint64_t value) {
         Entry e{key, {}};
         if (SUCCEEDED(InitPropVariantFromUInt64(value, &e.value))) values_.push_back(e);
+    }
+
+    // Mod and Deployed need the file's path: a file stream names it.
+    void AddStaging(IStream* stream) {
+        STATSTG st{};
+        if (FAILED(stream->Stat(&st, STATFLAG_DEFAULT)) || !st.pwcsName) return;
+        const std::wstring path = st.pwcsName;
+        CoTaskMemFree(st.pwcsName);
+        if (path.size() < 3 || path[1] != L':') return;
+        const std::wstring mod = ModOf(path), deployed = DeployedOf(path);
+        if (!mod.empty()) AddText(kPidMod, mod);
+        if (!deployed.empty()) AddText(kPidDeployed, deployed);
     }
 
     void AddText(DWORD pid, const std::wstring& text) {

@@ -32,6 +32,7 @@
 #include "plugin_tools.h"
 #include "folder_views.h"
 #include "auto_columns.h"
+#include "staging_info.h"
 #include <exdisp.h>
 #include <shlguid.h>
 #include <wrl/client.h>
@@ -1353,6 +1354,10 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (argc == 3 && !wcscmp(argv[1], L"--folderviews")) return views::Run(argv[2]);
     if (argc == 3 && !wcscmp(argv[1], L"--autocolumns")) return views::AutoRun(argv[2]);
+    if (argc >= 3 && !wcscmp(argv[1], L"--staging")) {  // reads only
+        for (int i = 2; i < argc; ++i) wprintf(L"%ls\n  Mod: [%ls]  Deployed: [%ls]\n", argv[i], pse::ModOf(argv[i]).c_str(), pse::DeployedOf(argv[i]).c_str());
+        return 0;
+    }
     if (argc == 4 && !wcscmp(argv[1], L"--namewindow")) return NameWindowShot(argv[2], argv[3]);
     if (argc == 4 && !wcscmp(argv[1], L"--papyrus")) return PapyrusList(argv[2], argv[3]);
     if (argc == 5 && !wcscmp(argv[1], L"--propswindow")) return PropsWindow(argv[2], argv[3], argv[4]);

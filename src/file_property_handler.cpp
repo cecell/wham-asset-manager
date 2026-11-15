@@ -3,6 +3,7 @@
 // file come from the saved results, or are worked out on the shared background
 // workers: text columns say "Working" until then, number columns stay blank.
 #include "file_property_handler.h"
+#include "staging_info.h"
 
 #include <propsys.h>
 #include <propvarutil.h>
@@ -166,6 +167,8 @@ public:
         if (!path_.empty()) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
         try {
             path_ = path;
+            AddKey(kPidMod);
+            AddKey(kPidDeployed);
             if (!HasAssetFacts(path_)) return S_OK;
             WIN32_FILE_ATTRIBUTE_DATA info{};
             if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info)) return S_OK;
@@ -204,6 +207,10 @@ public:
         if (IsEqualPropertyKey(key, PKEY_Media_Duration)) pid = kFactDuration;
         else if (key.fmtid == kPluginFmtid) pid = key.pid;
         else return S_OK;
+        if (pid == kPidMod || pid == kPidDeployed) {
+            const std::wstring v = pid == kPidMod ? ModOf(path_) : DeployedOf(path_);
+            return v.empty() ? S_OK : InitPropVariantFromString(v.c_str(), pv);
+        }
         std::lock_guard<std::mutex> g(lock_);
         try {
             const AssetFact* column = nullptr;
