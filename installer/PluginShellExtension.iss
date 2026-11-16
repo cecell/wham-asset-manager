@@ -224,6 +224,19 @@ begin
   AddTasksPageText;
 end;
 
+// An update restarts Explorer when it is done: say so before anything is installed.
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+begin
+  Result := '';
+  if FileExists(ExpandConstant('{app}\PluginShellExtension.dll')) then
+    Result := 'All File Explorer windows will be closed when setup finishes:' + NewLine +
+      Space + 'Explorer restarts so the new version is the one it runs.' + NewLine +
+      Space + 'Your desktop and taskbar come back by themselves.' + NewLine + NewLine;
+  if MemoDirInfo <> '' then Result := Result + MemoDirInfo + NewLine + NewLine;
+  if MemoGroupInfo <> '' then Result := Result + MemoGroupInfo + NewLine + NewLine;
+  if MemoTasksInfo <> '' then Result := Result + MemoTasksInfo + NewLine + NewLine;
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpLicense then
@@ -241,8 +254,9 @@ var
   WasUpdate: Boolean;
 
 // After an update, Explorer still runs the old DLL: the new DLL restarts
-// Explorer (its processes only) through Restart Manager, which reopens its
-// folder windows. Run as the user, not elevated, like Explorer itself.
+// Explorer (its processes only) at once, closing every File Explorer window;
+// the Ready page says so beforehand. Run as the user, not elevated, like
+// Explorer itself.
 procedure RestartExplorer;
 var
   Params: String;

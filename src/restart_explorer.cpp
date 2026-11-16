@@ -1,11 +1,10 @@
 // Restarts Windows Explorer after an update, so the new DLL is the one it
 // loads. Restart Manager proved unreliable for the shell (a long wait, then no
-// taskbar), so this does what Task Manager's "Restart" does, more gently:
-//  1. asks the shell to exit, as Ctrl+Shift+right-click on the taskbar > Exit
-//     Explorer does, so it saves its state;
-//  2. waits up to 10 s, then ends any Explorer process of this session left
-//     (folder windows in their own process, a shell that didn't exit);
-//  3. starts explorer.exe again and waits for the taskbar.
+// taskbar), so this does what Task Manager's "Restart" does:
+//  1. ends every Explorer process of this session at once (the shell, and
+//     folder windows in their own process); the setup said beforehand that
+//     every File Explorer window closes;
+//  2. starts explorer.exe again and waits for the taskbar.
 // Other programs that load the DLL (Everything's right-click menu, for one)
 // keep their copy until they restart.
 #include "restart_explorer.h"
@@ -17,8 +16,6 @@
 
 namespace pse {
 namespace {
-
-constexpr UINT kExitExplorer = WM_USER + 436;  // what "Exit Explorer" sends to the taskbar
 
 bool Elevated() {
     HANDLE token = nullptr;
@@ -65,8 +62,8 @@ HRESULT RestartExplorer() {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return S_FALSE;  // no shell running here: nothing to restart
 
-    PostMessageW(tray, kExitExplorer, 0, 0);
-    WaitFor(10000, [] { return ExplorerProcesses().empty(); });
+    // The setup told the user every File Explorer window closes: no waiting for a
+    // polite exit, which only made them watch the windows hang for seconds.
     for (DWORD pid : ExplorerProcesses()) {
         if (HANDLE p = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid)) {
             TerminateProcess(p, 0);
