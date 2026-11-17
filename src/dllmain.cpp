@@ -111,7 +111,17 @@ STDAPI DllUnregisterServer() { return pse::UnregisterHandler(HKEY_CURRENT_USER);
 // regsvr32 /n /i:columns PluginShellExtension.dll (elevated) registers the
 // property handler and schema (Explorer columns, details pane, tooltip); add
 // /u to remove them. The .propdesc must sit next to the DLL.
-STDAPI DllInstall(BOOL install, PCWSTR cmdLine) {
+STDAPI DllInstall(BOOL install, PCWSTR cmdLineIn) {
+    // Setup calls this in its own process, from a temporary copy of the DLL:
+    // "hash;<installed DLL>" registers the installed DLL's path instead of this
+    // copy's. Without ";<path>" (regsvr32) it is this DLL's own path.
+    std::wstring what = cmdLineIn ? cmdLineIn : L"", target;
+    if (const size_t semi = what.find(L';'); semi != std::wstring::npos) {
+        target = what.substr(semi + 1);
+        what.resize(semi);
+    }
+    const PCWSTR cmdLine = cmdLineIn ? what.c_str() : nullptr;
+    auto ModulePath = [&] { return target.empty() ? ::ModulePath() : target; };
     // regsvr32 /s /n /i:restartexplorer PluginShellExtension.dll: setup runs it
     // after an update, so Explorer loads the new DLL (it keeps the old one loaded).
     if (cmdLine && _wcsicmp(cmdLine, L"restartexplorer") == 0) {

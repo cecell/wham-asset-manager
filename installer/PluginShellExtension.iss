@@ -6,7 +6,8 @@
 ; and registers the context-menu handler under HKCU\Software\Classes. The
 ; optional "columns" task additionally registers the property handler and its
 ; schema machine-wide, which Windows only accepts from an elevated process: it
-; runs "regsvr32 /n /i:columns" through a UAC prompt.
+; runs "regsvr32 /n /i:columns" through a UAC prompt. Everything else calls the
+; installed DLL's DllInstall from Setup itself (a 64-bit setup).
 
 #ifndef AppVersion
   #define AppVersion "0.90"
@@ -50,6 +51,9 @@ DisableWelcomePage=yes
 LicenseFile=..\LICENSE
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; A 64-bit setup, so it can call the (64-bit) DLL's DllInstall itself for the
+; per-user registrations instead of starting regsvr32 for each.
+SetupArchitecture=x64
 MinVersion=10.0
 ; Follows the Windows light/dark app mode (Inno Setup 6.6 or newer).
 WizardStyle=modern dynamic
@@ -253,18 +257,36 @@ end;
 var
   WasUpdate: Boolean;
 
+// The installed DLL's DllInstall, called in this process: what "regsvr32 /n
+// /i:<what>" (or /u /n /i:<what>) would call, without starting regsvr32.
+// Setup can't name {app} here (it isn't known when Setup starts), so it loads
+// its own temporary copy and passes the installed DLL's path after a ";".
+function DllInstallSetup(Install: Integer; CmdLine: String): Integer;
+  external 'DllInstall@files:PluginShellExtension.dll stdcall delayload setuponly';
+function DllInstallUninst(Install: Integer; CmdLine: String): Integer;
+  external 'DllInstall@{app}\PluginShellExtension.dll stdcall delayload uninstallonly';
+
+function CallDllInstall(Install: Boolean; const What: String): Integer;
+begin
+  try
+    if IsUninstaller then
+      Result := DllInstallUninst(Ord(Install), What)
+    else
+      Result := DllInstallSetup(Ord(Install), What + ';' + ExpandConstant('{app}') + '\PluginShellExtension.dll');
+  except
+    Result := -1;
+    Log('DllInstall ' + What + ' failed: ' + GetExceptionMessage);
+  end;
+  Log(Format('DllInstall(%d, %s) -> 0x%.8x', [Ord(Install), What, Result]));
+end;
+
 // After an update, Explorer still runs the old DLL: the new DLL restarts
 // Explorer (its processes only) at once, closing every File Explorer window;
 // the Ready page says so beforehand. Run as the user, not elevated, like
 // Explorer itself.
 procedure RestartExplorer;
-var
-  Params: String;
-  Code: Integer;
 begin
-  Params := '/s /n /i:restartexplorer "' + ExpandConstant('{app}\PluginShellExtension.dll') + '"';
-  Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log(Format('regsvr32 %s -> code=%d', [Params, Code]));
+  CallDllInstall(True, 'restartexplorer');
 end;
 
 procedure DeleteOldCopies;
@@ -325,17 +347,10 @@ begin
   Result := RegKeyExists(HKCU, 'Software\Classes\*\shellex\ContextMenuHandlers\PluginShellExtensionHashes');
 end;
 
-// Runs regsvr32 /n /i:hash (or /u ...) on the installed DLL, for this user.
+// Adds (or removes) it for this user: DllInstall with "hash".
 procedure RunHashRegistration(Install: Boolean);
-var
-  Params: String;
-  Code: Integer;
 begin
-  Params := '/s /n /i:hash "' + ExpandConstant('{app}\PluginShellExtension.dll') + '"';
-  if not Install then
-    Params := '/u ' + Params;
-  Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log(Format('regsvr32 %s -> code=%d', [Params, Code]));
+  CallDllInstall(Install, 'hash');
 end;
 
 function FolderViewsRegistered: Boolean;
@@ -343,17 +358,10 @@ begin
   Result := RegKeyExists(HKCU, 'Software\Classes\Directory\Background\shellex\ContextMenuHandlers\PluginShellExtensionFolderViews');
 end;
 
-// Runs regsvr32 /n /i:views (or /u ...) on the installed DLL, for this user.
+// Adds (or removes) it for this user: DllInstall with "views".
 procedure RunFolderViewsRegistration(Install: Boolean);
-var
-  Params: String;
-  Code: Integer;
 begin
-  Params := '/s /n /i:views "' + ExpandConstant('{app}\PluginShellExtension.dll') + '"';
-  if not Install then
-    Params := '/u ' + Params;
-  Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log(Format('regsvr32 %s -> code=%d', [Params, Code]));
+  CallDllInstall(Install, 'views');
 end;
 
 function PapyrusMenuRegistered: Boolean;
@@ -361,17 +369,10 @@ begin
   Result := RegKeyExists(HKCU, 'Software\Classes\SystemFileAssociations\.pex\shellex\ContextMenuHandlers\PluginShellExtensionPapyrus');
 end;
 
-// Runs regsvr32 /n /i:papyrus (or /u ...) on the installed DLL, for this user.
+// Adds (or removes) it for this user: DllInstall with "papyrus".
 procedure RunPapyrusRegistration(Install: Boolean);
-var
-  Params: String;
-  Code: Integer;
 begin
-  Params := '/s /n /i:papyrus "' + ExpandConstant('{app}\PluginShellExtension.dll') + '"';
-  if not Install then
-    Params := '/u ' + Params;
-  Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log(Format('regsvr32 %s -> code=%d', [Params, Code]));
+  CallDllInstall(Install, 'papyrus');
 end;
 
 function BsaBrowseRegistered: Boolean;
@@ -379,17 +380,10 @@ begin
   Result := RegKeyExists(HKCU, 'Software\Classes\PluginShellExtension.BSA');
 end;
 
-// Runs regsvr32 /n /i:bsa (or /u ...) on the installed DLL, for this user.
+// Adds (or removes) it for this user: DllInstall with "bsa".
 procedure RunBsaRegistration(Install: Boolean);
-var
-  Params: String;
-  Code: Integer;
 begin
-  Params := '/s /n /i:bsa "' + ExpandConstant('{app}\PluginShellExtension.dll') + '"';
-  if not Install then
-    Params := '/u ' + Params;
-  Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
-  Log(Format('regsvr32 %s -> code=%d', [Params, Code]));
+  CallDllInstall(Install, 'bsa');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -450,6 +444,7 @@ begin
       RunColumnsRegistration(False);
     // Moved to %TEMP% (same volume in the usual case) so the program folder
     // can be removed even while Explorer still holds the DLL.
+    UnloadDLL(ExpandConstant('{app}\PluginShellExtension.dll'));
     MoveAside(ExpandConstant('{app}\PluginShellExtension.dll'), GetTempDir);
   end;
 end;
