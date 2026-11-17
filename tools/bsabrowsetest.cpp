@@ -577,7 +577,7 @@ int Run(const std::wstring& root) {
             after = pse::LoadFolderViews();
             matches = 0; cols = 0; shippedStill = false;
             for (auto& v : after) if (!_wcsicmp(v.name.c_str(), L"plugins")) { ++matches; cols = v.columns.size(); shippedStill = v.shipped; }
-            Expect(after.size() == 7 && matches == 1 && cols == 19 && shippedStill, L"removing it brings the preset back");
+            Expect(after.size() == 7 && matches == 1 && cols == 20 && shippedStill, L"removing it brings the preset back");
             win->Quit();
             Pump(800);
         }

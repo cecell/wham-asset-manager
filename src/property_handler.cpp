@@ -32,7 +32,7 @@ namespace {
 
 constexpr DWORD kPids[] = {kPidHeaderVersion, kPidRecordCount, kPidFlags, kPidLight,
                            kPidMasterCount,   kPidDeletedCount, kPidEslable, kPidMasters, kPidEslNote,
-                           kPidFormVersion, kPidDeletedNavm, kPidFormCount, kPidItm, kPidDirty, kPidTipStatus, kPidDependentCount, kPidMasterStatus, kPidMod, kPidDeployed};
+                           kPidFormVersion, kPidDeletedNavm, kPidFormCount, kPidItm, kPidDirty, kPidTipStatus, kPidDependentCount, kPidMasterStatus, kPidMod, kPidDeployed, kPidIsHardlink};
 
 // The two values that need the full record walk, cached per process so a
 // folder refresh does not rescan every plugin. Keyed by file name, size and
@@ -441,6 +441,10 @@ public:
             case kPidMod: {
                 const std::wstring mod = ModOf(path_);
                 return mod.empty() ? S_OK : InitPropVariantFromString(mod.c_str(), pv);
+            }
+            case kPidIsHardlink: {
+                const std::wstring v = IsHardlinkText(path_);
+                return v.empty() ? S_OK : InitPropVariantFromString(v.c_str(), pv);
             }
             case kPidDeployed: {
                 const std::wstring d = DeployedOf(path_);

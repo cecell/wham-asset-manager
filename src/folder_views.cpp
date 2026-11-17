@@ -37,7 +37,8 @@ std::mutex g_fileLock;
 #define PSE_COLUMN L"Cecell.PluginShellExtension."
 
 // Name, type, size and date come first in every preset, then every column
-// that this format has. A column that isn't installed is left out when applied.
+// that this format has, then Is Hardlink. A column that isn't installed is left
+// out when applied.
 struct PresetDefinition {
     const wchar_t* name;
     std::vector<const wchar_t*> columns;
@@ -73,6 +74,7 @@ std::vector<FolderViewState> ShippedViews() {
         state.shipped = true;
         for (const wchar_t* key : {L"System.ItemNameDisplay", L"System.ItemTypeText", L"System.Size", L"System.DateModified"}) state.columns.push_back({key, 0});
         for (const wchar_t* key : preset.columns) state.columns.push_back({key, 0});
+        state.columns.push_back({PSE_COLUMN L"IsHardlink", 0});
         state.sort.push_back({L"System.ItemNameDisplay", 1});
         views.push_back(std::move(state));
     }

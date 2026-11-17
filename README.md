@@ -102,8 +102,39 @@ Columns marked * read the whole file, so they fill in shortly after the folder o
 | Lip sync (`.lip`) | Lip Ver, Units |
 | `.dds` textures, in addition | Format, sRGB, Alpha, Cubemap |
 | `.fuz` voice files, in addition | Has Lip, Lip Ver, Units (of the lip data inside) |
+| `.wav` and `.xwm` sounds, in addition | Sample Rate, Channels, Audio Format |
+| All of the above, and plugins | Mod, Deployed, Is Hardlink (see below) |
+
+`.dds`, `.wav` and `.xwm` already have a handler of their own (Windows', or
+one you installed): WHAM sits in front of it, so its columns keep working and
+WHAM's are added. Uninstalling puts it back.
 
 **Folder views**, on a folder's background menu, has a preset for each of these.
+Every preset ends with Is Hardlink. The same menu has:
+
+- **Choose WHAM columns...**: like right-click a column header > More..., but
+  listing only WHAM's columns, grouped by file type, with a filter to show one
+  type (Textures, say). Tick a column to show it in this window.
+- **Auto columns** (ticked by default): a folder gets its preset when you
+  open it, from its name: `textures` > Textures, `meshes` > Meshes,
+  `animations` / `behaviors` > Animations, `sound` / `music` > Audio,
+  `scripts` > Scripts, and a `Data` folder with plugins in it > Plugins. Change
+  a folder's columns yourself and it stays as you left it; **Reset this folder
+  to auto columns** hands it back. The rules are in
+  `%LOCALAPPDATA%\Plugin Shell Extension\auto_columns.json`.
+
+### Mod, Deployed and Is Hardlink
+
+These tell where a file comes from in a mod manager's setup. WHAM finds the
+game's Data folder and the staging folders by itself: Vortex's (from its
+deployment file in Data), Mod Organizer 2's instances, and a folder saved with
+`skqe staging --set-staging`.
+
+| Column | Value |
+|---|---|
+| Mod | in a staging folder, the mod folder the file is in; in Data, the mod whose file it is (Vortex and deploy scripts put hardlinks into Data, so the other name of the same file tells) |
+| Deployed | for a file in a mod: **Yes** when the game sees this very file; **No (*mod* wins)** when another mod's file is there instead; **No (a loose file wins)**; **No** when nothing is deployed there. For Mod Organizer 2, which deploys nothing to Data, it follows the selected profile's mod order (the first line of `modlist.txt` wins): **No (Overwrite wins)**, **No (disabled in MO2)** |
+| Is Hardlink | **True** when the file has more than one name on disk (a hardlink, as Vortex deploys files), **False** when it has one |
 
 ### Upgrade header
 
@@ -165,6 +196,8 @@ Inside an archive in the game's Data folder (the folder next to `SkyrimSE.exe`) 
 
 - a **Winner** column: **Yes** when this archive's copy of the file is the one the game loads, **No** when a loose file in Data or a later-loading archive overrides it, or the game doesn't load this archive at all;
 - a **Winner** menu on a file: **Copy path** of the copy the game loads, **Go to** it in this window, or open it in a **New window**, with the file selected. That copy is a loose file in Data or a file inside another archive.
+
+In any archive, a file's menu also has **Copy filename** and **Copy relative path** (the path inside the archive, which is its path relative to Data, e.g. `textures\armor\iron\cuirass.dds`), one per line for several files.
 
 The winner follows the game's rules: a loose file in Data always wins; otherwise the archive that loads last wins. Archives load in this order: the archive lists in `Skyrim.ini` / `SkyrimCustom.ini` (the vanilla lists when neither sets one), then each active plugin's `<plugin>.bsa` and `<plugin> - Textures.bsa`, in load order (the base masters, `Skyrim.ccc`, then `plugins.txt`, masters first). These are the same rules [skqe](https://github.com/cecell/skyrim-query-engine) uses. If a plugin's own `.ini` changes the archive lists, the column stays empty, because that isn't modelled.
 
@@ -349,6 +382,8 @@ Debugging switches:
 - `src/bsa_folder.*`: shows a `.bsa` as a read-only folder in Explorer; files are copied out as virtual files
 - `src/dependents.*`: which plugins in a folder have a given plugin as a master (headers cached per folder), for #Dependents and List dependents
 - `src/winner.*`: which copy of a file the game loads from its Data folder (load order, archive ranks), for the Winner column and menu
+- `src/staging_find.*`, `src/staging_info.*`: the mod managers' staging folders, and the Mod, Deployed and Is Hardlink columns
+- `src/auto_columns.*`: Auto columns (a watcher in Explorer that applies a folder's preset when it opens)
 - `src/tool_menus.*`, `src/tool_windows.*`: the BSA manager submenu and the Hashes dialog
 - `src/bsa_tools.*`: extracting, testing, BSA facts and hashing, with no UI
 - `src/work_budget.*`: one limit on background work across every process; it slows work down as the machine gets busier

@@ -36,6 +36,9 @@ const wchar_t* PidName(DWORD pid) {
         case pse::kPidTipStatus: return L"(tooltip)";
         case pse::kPidDependentCount: return L"#Dependents";
         case pse::kPidMasterStatus: return L"MasterStatus";
+        case pse::kPidMod: return L"Mod";
+        case pse::kPidDeployed: return L"Deployed";
+        case pse::kPidIsHardlink: return L"IsHardlink";
     }
     return L"?";
 }

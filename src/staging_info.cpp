@@ -251,6 +251,17 @@ std::wstring ModOf(const std::wstring& path) {
     return {};
 }
 
+std::wstring IsHardlinkText(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(h, &info);
+    CloseHandle(h);
+    if (!ok) return {};
+    return info.nNumberOfLinks > 1 ? L"True" : L"False";
+}
+
 std::wstring DeployedOf(const std::wstring& path) {
     const std::shared_ptr<const Layout> current = Current();
     const Layout& l = *current;

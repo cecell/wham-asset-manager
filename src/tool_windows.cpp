@@ -989,7 +989,7 @@ const ChooserColumnDef kChooserColumns[] = {
     {L"ScriptName", L"Script", L"Scripts"}, {L"ScriptCompiled", L"Compiled", L"Scripts"}, {L"ScriptExtends", L"Extends", L"Scripts"},
     {L"ScriptFunctions", L"Functions", L"Scripts"}, {L"ScriptProperties", L"Properties", L"Scripts"}, {L"ScriptStates", L"States", L"Scripts"},
     {L"ScriptFlags", L"Script Flags", L"Scripts"}, {L"ScriptCompiledState", L"Compiled?", L"Scripts"},
-    {L"Mod", L"Mod", L"Mods"}, {L"Deployed", L"Deployed", L"Mods"},
+    {L"Mod", L"Mod", L"Mods"}, {L"Deployed", L"Deployed", L"Mods"}, {L"IsHardlink", L"Is Hardlink", L"Mods"},
 };
 const wchar_t* const kChooserGroups[] = {L"All types", L"Plugins", L"Archives", L"Meshes", L"Textures", L"Audio", L"Animations", L"Scripts", L"Mods"};
 constexpr wchar_t kWhamPrefix[] = L"Cecell.PluginShellExtension.";

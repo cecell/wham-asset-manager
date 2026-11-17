@@ -77,6 +77,7 @@ enum PluginPid : DWORD {
     kPidDependentCount = 62,  // UInt32  plugins in the same folder that have this one as a master
     kPidMasterStatus = 63,    // String  All active / Not active / Missing (see MasterStatusText)
     kPidMod = 64,             // String  the mod a file is from: its staging folder, or the staging copy of a Data file (staging_info.h)
+    kPidIsHardlink = 66,      // String  True / False: the file has more than one name on disk (staging_info.h)
     kPidDeployed = 65,        // String  a Vortex staging file: Yes / No (<mod> wins) / No (a loose file wins) / No
 };
 

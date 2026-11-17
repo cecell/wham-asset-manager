@@ -22,5 +22,9 @@ namespace pse {
 
 std::wstring ModOf(const std::wstring& path);
 std::wstring DeployedOf(const std::wstring& path);
+// "True" when the file has more than one name on disk (a hardlink: how Vortex
+// and deploy scripts put files into Data), "False" when it has one, empty when
+// it can't be read.
+std::wstring IsHardlinkText(const std::wstring& path);
 
 }  // namespace pse

@@ -192,6 +192,8 @@ private:
         const std::wstring mod = ModOf(path), deployed = DeployedOf(path);
         if (!mod.empty()) AddText(kPidMod, mod);
         if (!deployed.empty()) AddText(kPidDeployed, deployed);
+        const std::wstring link = IsHardlinkText(path);
+        if (!link.empty()) AddText(kPidIsHardlink, link);
     }
 
     void AddText(DWORD pid, const std::wstring& text) {

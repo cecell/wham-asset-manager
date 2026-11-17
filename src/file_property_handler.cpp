@@ -169,6 +169,7 @@ public:
             path_ = path;
             AddKey(kPidMod);
             AddKey(kPidDeployed);
+            AddKey(kPidIsHardlink);
             if (!HasAssetFacts(path_)) return S_OK;
             WIN32_FILE_ATTRIBUTE_DATA info{};
             if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info)) return S_OK;
@@ -207,8 +208,8 @@ public:
         if (IsEqualPropertyKey(key, PKEY_Media_Duration)) pid = kFactDuration;
         else if (key.fmtid == kPluginFmtid) pid = key.pid;
         else return S_OK;
-        if (pid == kPidMod || pid == kPidDeployed) {
-            const std::wstring v = pid == kPidMod ? ModOf(path_) : DeployedOf(path_);
+        if (pid == kPidMod || pid == kPidDeployed || pid == kPidIsHardlink) {
+            const std::wstring v = pid == kPidMod ? ModOf(path_) : pid == kPidDeployed ? DeployedOf(path_) : IsHardlinkText(path_);
             return v.empty() ? S_OK : InitPropVariantFromString(v.c_str(), pv);
         }
         std::lock_guard<std::mutex> g(lock_);
