@@ -89,6 +89,8 @@ Name: "hardlink"; Description: "  Add ""Hardlink"" to the right-click menu of ev
 
 [Files]
 Source: "{#BinDir}\PluginShellExtension.dll"; DestDir: "{app}"; Flags: ignoreversion
+; The DLL's symbols, so a crash dump from Explorer can be read.
+Source: "{#BinDir}\PluginShellExtension.pdb"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PluginShellExtension.propdesc"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\screenshot.png"; DestDir: "{app}\docs"; Flags: ignoreversion

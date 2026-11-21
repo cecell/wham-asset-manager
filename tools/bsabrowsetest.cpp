@@ -664,6 +664,63 @@ int AutoRun(const std::wstring& root) {
     } else {
         Expect(false, L"Explorer window on meshes\\armor");
     }
+    {   // a big Data folder of plugins, like a modded game's (thousands of files, loading for a while)
+        const std::wstring data = root + L"\\Game\\Data";
+        SHCreateDirectoryExW(nullptr, (data + L"\\textures").c_str(), nullptr);
+        auto touch = [](const std::wstring& f) { HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); CloseHandle(h); };
+        for (int i = 0; i < 4000; ++i) touch(data + L"\\Mod" + std::to_wstring(i) + L".esp");
+        for (int i = 0; i < 800; ++i) touch(data + L"\\Mod" + std::to_wstring(i) + L".bsa");
+        for (int i = 0; i < 500; ++i) touch(data + L"\\Mod" + std::to_wstring(i) + L".ini");
+        touch(data + L"\\Skyrim.esm");
+        Expect(pse::AutoPresetFor(data) == L"Plugins", L"Game\\Data with plugins -> Plugins");
+        auto web3 = Open(data);
+        if (web3 && ViewOf(web3.Get(), browser, view)) {
+            auto columns = [&] {
+                std::vector<PROPERTYKEY> keys;
+                ComPtr<IColumnManager> cm;
+                UINT n = 0;
+                browser->QueryActiveShellView(&view);
+                if (SUCCEEDED(view.As(&cm)) && SUCCEEDED(cm->GetColumnCount(CM_ENUM_VISIBLE, &n)) && n) {
+                    keys.resize(n);
+                    cm->GetColumns(CM_ENUM_VISIBLE, keys.data(), n);
+                }
+                return keys;
+            };
+            auto setColumns = [&](const std::vector<PROPERTYKEY>& keys) {
+                ComPtr<IColumnManager> cm;
+                browser->QueryActiveShellView(&view);
+                if (SUCCEEDED(view.As(&cm))) cm->SetColumns(keys.data(), static_cast<UINT>(keys.size()));
+            };
+            const std::vector<PROPERTYKEY> defaults = columns();
+            note = pse::ApplyAutoColumnsNow(browser.Get());
+            Expect(note == L"applied Plugins", (L"Data -> " + note).c_str());
+            // Let Explorer finish loading the folder, then visit again (DocumentComplete does that).
+            const ULONGLONG until = GetTickCount64() + 8000;
+            MSG msg;
+            while (GetTickCount64() < until) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+                Sleep(50);
+            }
+            note = pse::ApplyAutoColumnsNow(browser.Get());
+            Expect(note == L"already Plugins" && !pse::IsFolderManual(data), (L"Data, after loading -> " + note).c_str());
+            // Explorer lost the folder's saved view (it does when it crashes): the
+            // folder shows its default columns again. Not a hand change: apply again.
+            setColumns(defaults);
+            note = pse::ApplyAutoColumnsNow(browser.Get());
+            Expect(note == L"applied Plugins" && !pse::IsFolderManual(data), (L"Data, default columns again -> " + note).c_str());
+            note = pse::ApplyAutoColumnsNow(browser.Get());
+            Expect(note == L"already Plugins", (L"Data, then -> " + note).c_str());
+            // A real hand change still makes it the user's.
+            PROPERTYKEY name{};
+            PSGetPropertyKeyFromName(L"System.ItemNameDisplay", &name);
+            setColumns({name});
+            note = pse::ApplyAutoColumnsNow(browser.Get());
+            Expect(note == L"changed by hand" && pse::IsFolderManual(data), (L"Data, columns changed by hand -> " + note).c_str());
+            web3->Quit();
+        } else {
+            Expect(false, L"Explorer window on Game\\Data");
+        }
+    }
     pse::SetAutoColumnsEnabled(false);
     note = L"";
     wprintf(L"%d failed\n", g_fail);

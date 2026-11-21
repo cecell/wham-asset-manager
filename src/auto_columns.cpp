@@ -52,6 +52,7 @@ struct Store {
     bool enabled = false;
     std::vector<Rule> rules;
     std::map<std::wstring, std::wstring> applied;  // folder (lower case) -> the columns WHAM set
+    std::map<std::wstring, std::wstring> before;   // folder -> the columns it had just before (Explorer's default)
     std::set<std::wstring> manual;
 };
 
@@ -123,6 +124,9 @@ Store& Loaded() {  // g_lock held
             if (j.contains("applied") && j["applied"].is_object())
                 for (auto it = j["applied"].begin(); it != j["applied"].end(); ++it)
                     if (it.value().is_string()) s.applied[Wide(it.key())] = Wide(it.value().get<std::string>());
+            if (j.contains("before") && j["before"].is_object())
+                for (auto it = j["before"].begin(); it != j["before"].end(); ++it)
+                    if (it.value().is_string() && s.applied.count(Wide(it.key()))) s.before[Wide(it.key())] = Wide(it.value().get<std::string>());
             if (j.contains("manual") && j["manual"].is_array())
                 for (const json& m : j["manual"])
                     if (m.is_string()) s.manual.insert(Wide(m.get<std::string>()));
@@ -135,15 +139,16 @@ Store& Loaded() {  // g_lock held
 }
 
 void Save(const Store& s) {  // g_lock held
-    json rules = json::array(), applied = json::object(), manual = json::array();
+    json rules = json::array(), applied = json::object(), before = json::object(), manual = json::array();
     for (const Rule& r : s.rules) {
         json o = {{"folder", Utf8(r.folder)}, {"preset", Utf8(r.preset)}};
         if (r.hereOnly) o["here_only"] = true;
         rules.push_back(o);
     }
     for (const auto& [k, v] : s.applied) applied[Utf8(k)] = Utf8(v);
+    for (const auto& [k, v] : s.before) before[Utf8(k)] = Utf8(v);
     for (const auto& m : s.manual) manual.push_back(Utf8(m));
-    const std::string text = json{{"enabled", s.enabled}, {"rules", rules}, {"manual", manual}, {"applied", applied}}.dump(1);
+    const std::string text = json{{"enabled", s.enabled}, {"rules", rules}, {"manual", manual}, {"applied", applied}, {"before", before}}.dump(1);
     const std::wstring path = StorePath(), temp = path + L".tmp";
     {
         std::ofstream f(std::filesystem::path(temp), std::ios::binary | std::ios::trunc);
@@ -481,6 +486,7 @@ void MarkFolderManual(const std::wstring& folder) {
     const std::wstring k = FolderKey(folder);
     s.manual.insert(k);
     s.applied.erase(k);
+    s.before.erase(k);
     Save(s);
 }
 
@@ -492,6 +498,7 @@ void MarkFoldersManual(const std::vector<std::wstring>& folders) {
         const std::wstring k = FolderKey(f);
         s.manual.insert(k);
         s.applied.erase(k);
+        s.before.erase(k);
     }
     Save(s);
 }
@@ -507,6 +514,7 @@ void ResetFolderToAuto(const std::wstring& folder) {
     const std::wstring k = FolderKey(folder);
     s.manual.erase(k);
     s.applied.erase(k);
+    s.before.erase(k);
     Save(s);
 }
 
@@ -520,7 +528,7 @@ std::wstring ApplyAutoColumnsNow(IShellBrowser* browser) {
     if (folder.empty()) return L"not a folder";
     std::wstring preset;
     const std::wstring key = FolderKey(folder);
-    std::wstring last;
+    std::wstring last, lastBefore;
     {
         std::lock_guard<std::mutex> g(g_lock);
         Store& s = Loaded();
@@ -530,12 +538,19 @@ std::wstring ApplyAutoColumnsNow(IShellBrowser* browser) {
         if (s.manual.count(key)) return L"manual";
         auto it = s.applied.find(key);
         if (it != s.applied.end()) last = it->second;
+        auto b = s.before.find(key);
+        if (b != s.before.end()) lastBefore = b->second;
     }
     const std::wstring now = Signature(view.Get());
     if (!last.empty()) {
         if (last == now) return L"already " + preset;
-        MarkFolderManual(folder);  // the user changed what WHAM set: theirs from now on
-        return L"changed by hand";
+        // Back to the columns it had before WHAM's: Explorer lost the folder's
+        // saved view (it does after a crash, or when it drops old folders), the
+        // user didn't change anything. Apply again. Anything else is a hand change.
+        if (lastBefore.empty() || now != lastBefore) {
+            MarkFolderManual(folder);  // the user changed what WHAM set: theirs from now on
+            return L"changed by hand";
+        }
     }
     const std::vector<FolderViewState> views = LoadFolderViews();
     auto state = std::find_if(views.begin(), views.end(), [&](const FolderViewState& v) { return _wcsicmp(v.name.c_str(), preset.c_str()) == 0; });
@@ -544,8 +559,12 @@ std::wstring ApplyAutoColumnsNow(IShellBrowser* browser) {
     const std::wstring after = Signature(view.Get());
     std::lock_guard<std::mutex> g(g_lock);
     Store& s = Loaded();
-    if (s.applied.size() >= kMaxApplied) s.applied.erase(s.applied.begin());
+    if (s.applied.size() >= kMaxApplied && !s.applied.count(key)) {
+        s.before.erase(s.applied.begin()->first);
+        s.applied.erase(s.applied.begin());
+    }
     s.applied[key] = after;
+    s.before[key] = now;
     Save(s);
     return L"applied " + preset;
 }

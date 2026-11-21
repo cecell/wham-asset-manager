@@ -10,8 +10,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Static CRT: the DLL is loaded into explorer.exe and must not depend on a
 # VC++ redistributable being installed.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-# Release builds keep a PDB (build/bin/PluginShellExtension.pdb), so crash
-# dumps from users' Explorer can be named. /Zi and /DEBUG don't change the
+# Release builds keep a PDB (build/bin/PluginShellExtension.pdb), shipped next
+# to the DLL, so crash dumps from users' Explorer can be named; the DLL names it
+# without a folder (/PDBALTPATH). /Zi and /DEBUG don't change the
 # code; /OPT:REF and /OPT:ICF keep the linker's Release defaults that /DEBUG
 # would otherwise turn off.
 add_compile_options($<$<CONFIG:Release>:/Zi>)
@@ -150,7 +151,7 @@ endif()
 add_test(NAME watchset COMMAND watchsettest)
 
 set_target_properties(PluginShellExtension PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-target_link_options(PluginShellExtension PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")
+target_link_options(PluginShellExtension PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF;/INCREMENTAL:NO;/PDBALTPATH:%_PDB%>")
 
 # The installer: build/WHAM-<version>-setup.exe, built with Inno
 # Setup (6 or newer) when ISCC.exe is found (winget install JRSoftware.InnoSetup).

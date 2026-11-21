@@ -224,6 +224,10 @@ installs for the current user into
 `%LOCALAPPDATA%\Programs\WHAM` without an admin prompt
 (apart from the optional columns), and offers to open this README at the end.
 
+`PluginShellExtension.pdb` is installed next to the DLL: its debug symbols, so
+a crash dump of Explorer (WER keeps them in `%LOCALAPPDATA%\CrashDumps`)
+shows which WHAM function crashed. Send one with a bug report.
+
 On Windows 11 the menu item is in the classic menu: right-click > **Show more
 options**, or Shift+right-click.
 
@@ -254,7 +258,7 @@ Windows runner, not on a personal PC:
 - the compiler is pinned to MSVC 14.44, and its exact version is in the log
 - Inno Setup 7.1.1 is downloaded from its official release and checked
   against a pinned SHA-256 before use
-- every run publishes `SHA256SUMS.txt` for the DLL and the installer, in the
+- every run publishes `SHA256SUMS.txt` for the DLL, its PDB and the installer, in the
   run summary and in its downloadable artifact
 - a release attaches one run's files unchanged, so they are byte for byte the
   files that run hashed; the release notes link the run and the VirusTotal

@@ -66,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           $dist = New-Item -ItemType Directory -Force dist
-          Copy-Item build\bin\PluginShellExtension.dll, build\WHAM-*-setup.exe $dist
+          Copy-Item build\bin\PluginShellExtension.dll, build\bin\PluginShellExtension.pdb, build\WHAM-*-setup.exe $dist
           $lines = Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
             "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           }
@@ -85,6 +85,7 @@ jobs:
         with:
           subject-path: |
             dist/PluginShellExtension.dll
+            dist/PluginShellExtension.pdb
             dist/WHAM-*-setup.exe
 
       - uses: actions/upload-artifact@v5
@@ -92,15 +93,6 @@ jobs:
           name: PluginShellExtension
           path: dist/
           if-no-files-found: error
-
-      # The DLL's PDB, to name the frames in crash dumps from users' machines.
-      # A separate artifact, so the release files and their hashes don't change.
-      - uses: actions/upload-artifact@v5
-        with:
-          name: PluginShellExtension-pdb
-          path: build/bin/PluginShellExtension.pdb
-          if-no-files-found: error
-          retention-days: 90
 
       - name: VirusTotal scan
         if: ${{ github.event_name != 'pull_request' }}
