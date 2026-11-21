@@ -59,6 +59,7 @@ jobs:
           cmake --version
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
           cmake --build build || exit /b 1
+          ctest --test-dir build --output-on-failure || exit /b 1
 
       - name: Hash
         id: hash
@@ -91,6 +92,15 @@ jobs:
           name: PluginShellExtension
           path: dist/
           if-no-files-found: error
+
+      # The DLL's PDB, to name the frames in crash dumps from users' machines.
+      # A separate artifact, so the release files and their hashes don't change.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: PluginShellExtension-pdb
+          path: build/bin/PluginShellExtension.pdb
+          if-no-files-found: error
+          retention-days: 90
 
       - name: VirusTotal scan
         if: ${{ github.event_name != 'pull_request' }}

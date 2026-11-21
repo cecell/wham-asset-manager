@@ -10,6 +10,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Static CRT: the DLL is loaded into explorer.exe and must not depend on a
 # VC++ redistributable being installed.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# Release builds keep a PDB (build/bin/PluginShellExtension.pdb), so crash
+# dumps from users' Explorer can be named. /Zi and /DEBUG don't change the
+# code; /OPT:REF and /OPT:ICF keep the linker's Release defaults that /DEBUG
+# would otherwise turn off.
+add_compile_options($<$<CONFIG:Release>:/Zi>)
 
 # bsa-reader (GPL-3.0, github.com/cecell/bsa-reader): BSA v103-105 with zlib
 # and LZ4, used to read localized strings packed in archives. Pinned to the
@@ -131,7 +136,21 @@ target_link_libraries(menutest PRIVATE psecore shell32 ole32)
 add_executable(hardlinktest tools/hardlinktest.cpp)
 target_link_libraries(hardlinktest PRIVATE shell32 ole32)
 
+# Regression test for the Auto columns watcher (0.99.1 explorer.exe heap
+# corruption): ctest --test-dir build. -DPSE_ASAN=ON builds it with
+# AddressSanitizer (the ASan DLL must be on PATH when it runs).
+option(PSE_ASAN "Build watchsettest with AddressSanitizer" OFF)
+enable_testing()
+add_executable(watchsettest tools/watchsettest.cpp)
+target_include_directories(watchsettest PRIVATE src)
+if(PSE_ASAN)
+    target_compile_options(watchsettest PRIVATE /fsanitize=address /Zi)
+    target_link_options(watchsettest PRIVATE /INCREMENTAL:NO /DEBUG)
+endif()
+add_test(NAME watchset COMMAND watchsettest)
+
 set_target_properties(PluginShellExtension PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+target_link_options(PluginShellExtension PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")
 
 # The installer: build/WHAM-<version>-setup.exe, built with Inno
 # Setup (6 or newer) when ISCC.exe is found (winget install JRSoftware.InnoSetup).

@@ -28,6 +28,7 @@
 
 #include "debug_log.h"
 #include "folder_views.h"
+#include "watch_set.h"
 
 namespace pse {
 namespace {
@@ -324,6 +325,8 @@ public:
         if (!r) delete this;
         return static_cast<ULONG>(r);
     }
+    // The callback captures the watcher's locals: drop it before they go.
+    void Disconnect() { onWindows_ = nullptr; }
     IFACEMETHODIMP GetTypeInfoCount(UINT* n) override {
         *n = 0;
         return S_OK;
@@ -356,68 +359,59 @@ DWORD WINAPI WatchThread(void*) {
     {
         ComPtr<IShellWindows> windows;
         if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows)))) {
-            std::map<HWND, Attached> attached;
-            auto detach = [&](HWND hwnd) {
-                auto it = attached.find(hwnd);
-                if (it == attached.end()) return;
-                it->second.cp->Unadvise(it->second.cookie);
-                attached.erase(it);
-            };
+            // Every COM call below can re-enter attachAll (see watch_set.h):
+            // entries leave `attached` before their Unadvise, and attachAll never nests.
+            WatchSet<HWND, Attached> attached([](Attached& a) {
+                if (a.cp) a.cp->Unadvise(a.cookie);
+            });
+            SerialPass pass;
             auto attachAll = [&] {
-                // Windows ShellWindows no longer lists are closing: let go of them.
-                std::set<HWND> listed;
-                long count = 0;
-                windows->get_Count(&count);
-                for (long i = 0; i < count; ++i) {
-                    VARIANT v;
-                    VariantInit(&v);
-                    v.vt = VT_I4;
-                    v.lVal = i;
-                    ComPtr<IDispatch> disp;
-                    ComPtr<IWebBrowser2> wb;
-                    SHANDLE_PTR h = 0;
-                    if (SUCCEEDED(windows->Item(v, &disp)) && disp && SUCCEEDED(disp.As(&wb)) && SUCCEEDED(wb->get_HWND(&h)))
-                        listed.insert(reinterpret_cast<HWND>(h));
-                }
-                for (auto it = attached.begin(); it != attached.end();) {
-                    if (!listed.count(it->first) || !IsWindow(it->first)) {
-                        it->second.cp->Unadvise(it->second.cookie);
-                        it = attached.erase(it);
-                    } else {
-                        ++it;
+                pass.Run([&] {
+                    // Windows ShellWindows no longer lists are closing: let go of them.
+                    std::set<HWND> listed;
+                    long count = 0;
+                    windows->get_Count(&count);
+                    for (long i = 0; i < count; ++i) {
+                        VARIANT v;
+                        VariantInit(&v);
+                        v.vt = VT_I4;
+                        v.lVal = i;
+                        ComPtr<IDispatch> disp;
+                        ComPtr<IWebBrowser2> wb;
+                        SHANDLE_PTR h = 0;
+                        if (SUCCEEDED(windows->Item(v, &disp)) && disp && SUCCEEDED(disp.As(&wb)) && SUCCEEDED(wb->get_HWND(&h)))
+                            listed.insert(reinterpret_cast<HWND>(h));
                     }
-                }
-                count = 0;
-                windows->get_Count(&count);
-                for (long i = 0; i < count; ++i) {
-                    VARIANT v;
-                    VariantInit(&v);
-                    v.vt = VT_I4;
-                    v.lVal = i;
-                    ComPtr<IDispatch> disp;
-                    ComPtr<IWebBrowser2> wb;
-                    SHANDLE_PTR h = 0;
-                    if (FAILED(windows->Item(v, &disp)) || !disp || FAILED(disp.As(&wb)) || FAILED(wb->get_HWND(&h))) continue;
-                    const HWND hwnd = reinterpret_cast<HWND>(h);
-                    if (attached.count(hwnd)) continue;
-                    ComPtr<IConnectionPointContainer> cpc;
-                    ComPtr<IConnectionPoint> cp;
-                    if (FAILED(wb.As(&cpc)) || FAILED(cpc->FindConnectionPoint(DIID_DWebBrowserEvents2, &cp))) continue;
-                    auto* sink = new Sink(DIID_DWebBrowserEvents2, hwnd, nullptr);
-                    DWORD cookie = 0;
-                    if (SUCCEEDED(cp->Advise(sink, &cookie))) {
-                        attached[hwnd] = {cp, cookie};
-                        Request(hwnd);  // the folder it shows now
+                    attached.RemoveIf([&](HWND hwnd) { return !listed.count(hwnd) || !IsWindow(hwnd); });
+                    count = 0;
+                    windows->get_Count(&count);
+                    for (long i = 0; i < count; ++i) {
+                        VARIANT v;
+                        VariantInit(&v);
+                        v.vt = VT_I4;
+                        v.lVal = i;
+                        ComPtr<IDispatch> disp;
+                        ComPtr<IWebBrowser2> wb;
+                        SHANDLE_PTR h = 0;
+                        if (FAILED(windows->Item(v, &disp)) || !disp || FAILED(disp.As(&wb)) || FAILED(wb->get_HWND(&h))) continue;
+                        const HWND hwnd = reinterpret_cast<HWND>(h);
+                        if (attached.Contains(hwnd)) continue;
+                        ComPtr<IConnectionPointContainer> cpc;
+                        ComPtr<IConnectionPoint> cp;
+                        if (FAILED(wb.As(&cpc)) || FAILED(cpc->FindConnectionPoint(DIID_DWebBrowserEvents2, &cp))) continue;
+                        auto* sink = new Sink(DIID_DWebBrowserEvents2, hwnd, nullptr);
+                        DWORD cookie = 0;
+                        if (SUCCEEDED(cp->Advise(sink, &cookie)) && attached.Add(hwnd, {cp, cookie}))
+                            Request(hwnd);  // the folder it shows now
+                        sink->Release();
                     }
-                    sink->Release();
-                }
+                });
             };
             ComPtr<IConnectionPointContainer> cpc;
             ComPtr<IConnectionPoint> cp;
             DWORD cookie = 0;
             auto* sink = new Sink(DIID_DShellWindowsEvents, nullptr, attachAll);
             if (SUCCEEDED(windows.As(&cpc)) && SUCCEEDED(cpc->FindConnectionPoint(DIID_DShellWindowsEvents, &cp))) cp->Advise(sink, &cookie);
-            sink->Release();
             attachAll();
             // When the shell exits (the taskbar goes away: "Exit Explorer", a
             // restart, sign-out) the watcher lets go of everything and ends, so
@@ -427,7 +421,7 @@ DWORD WINAPI WatchThread(void*) {
             MSG msg;
             while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
                 if (!msg.hwnd && msg.message == kMsgDetach) {
-                    detach(reinterpret_cast<HWND>(msg.lParam));
+                    attached.Remove(reinterpret_cast<HWND>(msg.lParam));
                     continue;
                 }
                 if (!msg.hwnd && msg.message == WM_TIMER && msg.wParam == timer) {
@@ -439,9 +433,11 @@ DWORD WINAPI WatchThread(void*) {
                 DispatchMessageW(&msg);
             }
             KillTimer(nullptr, timer);
+            pass.Stop();  // events that still arrive during the Unadvise calls below do nothing
             if (cp && cookie) cp->Unadvise(cookie);
-            for (auto& [h, a] : attached) a.cp->Unadvise(a.cookie);
-            attached.clear();
+            sink->Disconnect();  // it may outlive this frame if Explorer keeps a reference
+            sink->Release();
+            attached.Clear();
             std::lock_guard<std::mutex> g(g_lock);
             for (auto& [tid, h] : g_hooks) UnhookWindowsHookEx(h);
             g_hooks.clear();
