@@ -4,7 +4,10 @@
 //  1. ends every Explorer process of this session at once (the shell, and
 //     folder windows in their own process); the setup said beforehand that
 //     every File Explorer window closes;
-//  2. starts explorer.exe again and waits for the taskbar.
+//  2. waits for Windows to start the shell again by itself (Winlogon does when
+//     the shell ends), and starts explorer.exe only when it doesn't: started
+//     while a shell is already running, explorer.exe opens a folder window
+//     instead, which came up over the setup's last page (0.99.1).
 // Other programs that load the DLL (Everything's right-click menu, for one)
 // keep their copy until they restart.
 #include "restart_explorer.h"
@@ -71,6 +74,12 @@ HRESULT RestartExplorer() {
             CloseHandle(p);
         }
     }
+
+    // Windows restarts the shell by itself (Winlogon's AutoRestartShell, on by
+    // default). Starting a second explorer.exe while that one comes up opens a
+    // File Explorer window, so only start one if none appears.
+    if (WaitFor(8000, [] { return !ExplorerProcesses().empty(); }))
+        return WaitFor(15000, [] { return FindWindowW(L"Shell_TrayWnd", nullptr) != nullptr; }) ? S_OK : S_FALSE;
 
     wchar_t windows[MAX_PATH] = {};
     GetWindowsDirectoryW(windows, MAX_PATH);

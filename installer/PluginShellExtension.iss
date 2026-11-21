@@ -235,7 +235,7 @@ function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoType
 begin
   Result := '';
   if FileExists(ExpandConstant('{app}\PluginShellExtension.dll')) then
-    Result := 'All File Explorer windows will be closed when setup finishes:' + NewLine +
+    Result := 'All File Explorer windows will be closed when you click Finish:' + NewLine +
       Space + 'Explorer restarts so the new version is the one it runs.' + NewLine +
       Space + 'Your desktop and taskbar come back by themselves.' + NewLine + NewLine;
   if MemoDirInfo <> '' then Result := Result + MemoDirInfo + NewLine + NewLine;
@@ -283,9 +283,10 @@ begin
 end;
 
 // After an update, Explorer still runs the old DLL: the new DLL restarts
-// Explorer (its processes only) at once, closing every File Explorer window;
-// the Ready page says so beforehand. Run as the user, not elevated, like
-// Explorer itself.
+// Explorer (its processes only) once the user clicks Finish, closing every
+// File Explorer window; the Ready page says so beforehand. The shell comes back
+// with no folder window (see restart_explorer.cpp). Run as the user, not
+// elevated, like Explorer itself.
 procedure RestartExplorer;
 begin
   CallDllInstall(True, 'restartexplorer');
@@ -423,10 +424,12 @@ begin
       RegDeleteKeyIncludingSubkeys(HKA, '{#HardlinkMenuKey}');
       RegDeleteKeyIncludingSubkeys(HKA, '{#HardlinkClsidKey}');
     end;
-    if WasUpdate then begin
-      RestartExplorer;
-      DeleteOldCopies;  // Explorer has let go of the old DLL now
-    end;
+  end;
+  // After Finish, when no setup window is left for anything to cover. The README
+  // (when ticked) opens before this, in its own program.
+  if (CurStep = ssDone) and WasUpdate then begin
+    RestartExplorer;
+    DeleteOldCopies;  // Explorer has let go of the old DLL now
   end;
 end;
 
