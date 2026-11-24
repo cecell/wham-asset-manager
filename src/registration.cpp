@@ -139,6 +139,32 @@ void RemoveFolderViewsMenu(HKEY root, const std::wstring& classes) {
     RegDeleteKeyW(root, clsid.c_str());
 }
 
+// Where Search text is offered: a folder, a folder's empty space, a drive, a .bsa file.
+const wchar_t* const kSearchMenuKeys[] = {L"Directory\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch",
+                                          L"Directory\\Background\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch",
+                                          L"Drive\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch",
+                                          L"SystemFileAssociations\\.bsa\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch"};
+
+bool InstallSearchMenu(HKEY root, const std::wstring& classes, const std::wstring& dllPath) {
+    const std::wstring clsid = classes + L"CLSID\\" + kSearchMenuClsidString;
+    LSTATUS st = WriteHandler(root, clsid, L"WHAM search menu", dllPath);
+    for (const wchar_t* key : kSearchMenuKeys) {
+        if (st == ERROR_SUCCESS) st = SetString(root, classes + key, nullptr, kSearchMenuClsidString);
+    }
+    if (st != ERROR_SUCCESS) RemoveSearchMenu(root, classes);
+    return st == ERROR_SUCCESS;
+}
+
+void RemoveSearchMenu(HKEY root, const std::wstring& classes) {
+    for (const wchar_t* key : kSearchMenuKeys) {
+        RegDeleteTreeW(root, (classes + key).c_str());
+        RegDeleteKeyW(root, (classes + key).c_str());
+    }
+    const std::wstring clsid = classes + L"CLSID\\" + kSearchMenuClsidString;
+    RegDeleteTreeW(root, clsid.c_str());
+    RegDeleteKeyW(root, clsid.c_str());
+}
+
 bool InstallPapyrusMenu(HKEY root, const std::wstring& classes, const std::wstring& dllPath) {
     const std::wstring clsid = classes + L"CLSID\\" + kPapyrusMenuClsidString;
     LSTATUS st = WriteHandler(root, clsid, L"WHAM Papyrus menu", dllPath);

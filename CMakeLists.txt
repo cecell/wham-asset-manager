@@ -85,6 +85,9 @@ add_library(PluginShellExtension SHARED
     src/tool_menus.cpp
     src/folder_views_menu.cpp
     src/tool_windows.cpp
+    src/window_common.cpp
+    src/search_window.cpp
+    src/search_menu.cpp
     src/embedded_patterns.cpp
     src/PluginShellExtension.def
     src/PluginShellExtension.rc
@@ -118,6 +121,7 @@ add_library(psetools STATIC
     src/disk_cache.cpp
     src/winner.cpp
     src/dependents.cpp
+    src/search_options.cpp
     src/text_search.cpp)
 target_include_directories(psetools PUBLIC src)
 target_link_libraries(psetools PUBLIC psecore psepattern bsa::reader asset::metadata skqe::papyrus bcrypt advapi32 shell32 ole32 propsys shlwapi)

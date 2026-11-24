@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <cctype>
@@ -1883,6 +1884,12 @@ bool OpenInEditor(const std::wstring& path, uint32_t line, std::wstring& error) 
         if (line > 0) cmd += L" -n" + std::to_wstring(line);
         cmd += L" \"" + path + L"\"";
         if (Launch(cmd)) return true;
+    }
+    // The mask is the user's: a .bat or .js added to it must be shown, never run.
+    if (AssocIsDangerous(PathFindExtensionW(path.c_str()))) {
+        if (Launch(L"notepad.exe \"" + path + L"\"")) return true;
+        error = L"Couldn't open " + path + L": " + WindowsError(GetLastError());
+        return false;
     }
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);

@@ -201,6 +201,72 @@ In any archive, a file's menu also has **Copy filename** and **Copy relative pat
 
 The winner follows the game's rules: a loose file in Data always wins; otherwise the archive that loads last wins. Archives load in this order: the archive lists in `Skyrim.ini` / `SkyrimCustom.ini` (the vanilla lists when neither sets one), then each active plugin's `<plugin>.bsa` and `<plugin> - Textures.bsa`, in load order (the base masters, `Skyrim.ccc`, then `plugins.txt`, masters first). These are the same rules [skqe](https://github.com/cecell/skyrim-query-engine) uses. If a plugin's own `.ini` changes the archive lists, the column stays empty, because that isn't modelled.
 
+## Search text
+
+An optional setup task adds **Search text…** to the right-click menu of a
+folder, a drive, the empty space inside a folder, and a `.bsa` file. It finds
+text in scripts and other text files, inside `.bsa` archives too.
+
+Pick a folder or a `.bsa`, type what to find and press Enter. The **In** box
+holds the place to search and can be edited. Results appear while the search
+runs; **Cancel** (or Esc) stops it.
+
+**What is searched**
+
+- The scope is the folder and everything under it, every `.bsa` found there
+  included, or a single `.bsa`.
+- By default: `.psc` files, in any folder except the asset folders (`meshes`,
+  `textures`, `sound`, `music`, `video`, `strings`, `seq`, `grass`,
+  `lodsettings`, `shadersfx` and `interface`).
+- **Other text files** also searches the types in the box next to it (`.txt .ini
+  .json .xml .yaml .toml .lst .csv` to start with; change them as you like).
+  The asset folders are searched then too.
+- Archives are read in memory. Nothing is extracted to disk to search it.
+- **Decompile .pex that have no source** also searches the decompiled text of a
+  `.pex` when there is no `.psc` of the same name in the scope.
+- Files that look binary (they contain NUL bytes) are skipped. Text is read as
+  UTF-8, UTF-16, or Windows-1252 when it isn't valid UTF-8.
+
+**Options**
+
+- **Match case**: off by default (ASCII letters match either case).
+- **Whole word**: the match must not touch a letter, digit or `_` on either side.
+- **Regex**: the text is a [PCRE2](https://github.com/PCRE2Project/pcre2)
+  pattern, matched against one line at a time, so `^` and `$` are line anchors
+  and a match can't run across lines. A pattern that must contain a fixed piece
+  of text (a literal of three or more characters, such as `Debug\.Trace`)
+  searches much faster than one that doesn't (`\d+`). A pattern that doesn't
+  compile shows its error under the list.
+
+The options are remembered between windows, in
+`%LOCALAPPDATA%\Plugin Shell Extension\search_options.json`.
+
+**Results**
+
+The list shows the file (relative to the scope; inside an archive it starts with
+the archive's name), the line number, and the line, with each match highlighted.
+Under the list: how many lines matched, how much was searched and how long it
+took, plus anything that couldn't be read. A search stops after 200,000
+matching lines and says so.
+
+- Double-click a row, or select it and press Enter, to open that line. WHAM uses
+  Notepad++ at that line if it is installed, and the default editor for the file
+  otherwise.
+- A hit inside an archive opens a read-only copy in
+  `%TEMP%\WHAM search\<archive name>\`, named after the archive. Copies older
+  than a day are deleted the next time the window opens.
+- Right-click a row for **Open**, **Copy path** (a loose file's path; for an
+  archive, the archive's path and the file's path inside it) and **Copy line**.
+- **Copy results** copies every row as `file:line:text`, with a first line that
+  names the search.
+
+**Command line**
+
+`wham-search` does the same search without a window:
+`wham-search [options] <pattern> <folder-or-bsa>`, one `file:line:text` per
+line. Run it with no arguments to see the options. It is built with the project
+(`build\wham-search.exe`) and is not part of the setup.
+
 ## Hardlink menu (optional)
 
 An optional setup task adds **Hardlink** to the right-click menu of every
@@ -315,6 +381,8 @@ The inflate code in `src/inflate.cpp` is altered from puff, by Mark Adler, part
 of the [zlib](https://github.com/madler/zlib) distribution. Its notice is in that
 file.
 
+The regex mode of Search text uses [PCRE2](https://github.com/PCRE2Project/pcre2) (BSD licence; its notice is in [`LICENSES/PCRE2.txt`](LICENSES/PCRE2.txt)), built into the DLL.
+
 Saved folder views are stored with [JSON for Modern C++](https://github.com/nlohmann/json) by Niels Lohmann, used under the MIT licence:
 
 > Copyright (c) 2013-2022 Niels Lohmann
@@ -350,7 +418,8 @@ Outputs, in `build\`:
 - `plugininfo.exe <plugin>...`: prints the same fields, plus a self-check that the records and groups walked add up to the header count
 - `menutest.exe <plugin> [--invoke]`: builds Explorer's right-click menu for a file and checks the item is there (and opens)
 - `winnertest.exe <Data\x.bsa> [limit]`: the archive plan, and which copy wins for each file of x.bsa; `--all <Data\x.bsa>` lists every file of every loaded archive
-- `bsabrowsetest.exe`: walks archives through the BSA folder, and drives it in Windows' real folder view
+- `bsabrowsetest.exe`: walks archives through the BSA folder, and drives it in Windows' real folder view; `--search <dll> <scope> <query> <png>` saves a picture of the Search text window, and `--searchmenu <dll> <temp folder> <bsa> <file>` checks its menu straight from the DLL
+- `wham-search.exe <pattern> <folder-or-bsa>`: Search text on the command line; `textsearchtest.exe wham-search.exe` tests the search engine and this tool (it builds its own files under `%TEMP%`)
 - `assetproptest.exe <dll> <file>...`: the same for `.tga` and `.fuz` files, through the asset property handler
 - `proptest.exe <dll> <plugin>...`: loads the property handler from the DLL without registering it, feeds it a file the way Explorer does, and prints every column value
 
@@ -389,6 +458,9 @@ Debugging switches:
 - `src/staging_find.*`, `src/staging_info.*`: the mod managers' staging folders, and the Mod, Deployed and Is Hardlink columns
 - `src/auto_columns.*`: Auto columns (a watcher in Explorer that applies a folder's preset when it opens)
 - `src/tool_menus.*`, `src/tool_windows.*`: the BSA manager submenu and the Hashes dialog
+- `src/text_search.*`: the Search text engine (loose files and archives, PCRE2 regex, opening a hit in an editor), with no UI; `tools/wham_search.cpp` is its command line
+- `src/search_window.*`, `src/search_menu.*`, `src/search_options.*`: the Search text window, its right-click menu, and the options it remembers
+- `src/window_common.*`: what the tool windows share (theme colours, DPI, the DLL reference a window thread holds)
 - `src/bsa_tools.*`: extracting, testing, BSA facts and hashing, with no UI
 - `src/work_budget.*`: one limit on background work across every process; it slows work down as the machine gets busier
 - `src/asset_property_handler.*`: fills Windows' own Dimensions, Duration, Bit rate and similar columns for `.tga` and `.fuz`, and adds a Mipmaps column for `.dds` on top of Windows' own handler

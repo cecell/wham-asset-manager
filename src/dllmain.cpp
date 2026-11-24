@@ -14,6 +14,8 @@
 #include "asset_property_handler.h"
 #include "bsa_folder.h"
 #include "tool_menus.h"
+#include "search_menu.h"
+#include "search_window.h"
 #include "folder_views_menu.h"
 #include "file_property_handler.h"
 #include "tool_windows.h"
@@ -91,6 +93,7 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
     if (clsid == pse::kClsidHashMenu) return pse::CreateHashMenuFactory(riid, ppv);
     if (clsid == pse::kClsidPapyrusMenu) return pse::CreatePapyrusMenuFactory(riid, ppv);
     if (clsid == pse::kClsidFolderViewsMenu) return pse::CreateFolderViewsMenuFactory(riid, ppv);
+    if (clsid == pse::kClsidSearchMenu) return pse::CreateSearchMenuFactory(riid, ppv);
     if (clsid == pse::kClsidContextMenu) return pse::CreateClassFactory(riid, ppv);
     if (clsid == pse::kClsidPropertyHandler) return pse::CreatePropertyHandlerFactory(riid, ppv);
     if (clsid == pse::kClsidAssetPropertyHandler) return pse::CreateAssetPropertyHandlerFactory(riid, ppv);
@@ -154,6 +157,17 @@ STDAPI DllInstall(BOOL install, PCWSTR cmdLineIn) {
         }
         return S_OK;
     }
+    // regsvr32 /n /i:search PluginShellExtension.dll adds Search text to the menu
+    // of folders, drives, folder backgrounds and .bsa files, for this user; add
+    // /u to remove it.
+    if (cmdLine && _wcsicmp(cmdLine, L"search") == 0) {
+        if (install) {
+            if (!pse::InstallSearchMenu(HKEY_CURRENT_USER, L"Software\\Classes\\", ModulePath())) return E_FAIL;
+        } else {
+            pse::RemoveSearchMenu(HKEY_CURRENT_USER, L"Software\\Classes\\");
+        }
+        return S_OK;
+    }
     // regsvr32 /n /i:papyrus PluginShellExtension.dll adds Decompile to .pex and
     // Compile to .psc, for this user; add /u to remove them.
     if (cmdLine && _wcsicmp(cmdLine, L"papyrus") == 0) {
@@ -201,6 +215,7 @@ extern "C" int __stdcall PseFolderViewNameSnapshot(const wchar_t* png) {
 }
 extern "C" int __stdcall PseReportSnapshot(const wchar_t* title, int status, const wchar_t* text, const wchar_t* png) { return pse::RunReportWindow(title, status, text, png); }
 extern "C" int __stdcall PseDependentsSnapshot(const wchar_t* plugin, const wchar_t* png) { return pse::RunDependentsWindow(plugin, png); }
+extern "C" int __stdcall PseSearchSnapshot(const wchar_t* scope, const wchar_t* query, const wchar_t* png) { return pse::RunSearchWindow(scope, query, png); }
 extern "C" int __stdcall PseColumnChooserSnapshot(const wchar_t* filter, const wchar_t* png) {
     std::wstring checked;
     pse::RunColumnChooser(nullptr, nullptr, png, filter, &checked);

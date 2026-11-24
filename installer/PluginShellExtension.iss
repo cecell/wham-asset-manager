@@ -85,6 +85,7 @@ Name: "bsa"; Description: "  Browse .bsa archives in Explorer and add the BSA ma
 Name: "hashes"; Description: "  Add ""Hashes"" to the right-click menu of every file (SHA-256, CRC-32 and MD5)"
 Name: "papyrus"; Description: "  Add ""Decompile"" to .pex and ""Compile"" to .psc files in the right-click menu"
 Name: "folderviews"; Description: "  Add ""Folder views"" to the folder background menu (save layouts and apply them to other folders)"
+Name: "search"; Description: "  Add ""Search text..."" to the right-click menu of folders and .bsa files (searches scripts and text, inside archives too)"
 Name: "hardlink"; Description: "  Add ""Hardlink"" to the right-click menu of every file (copy or open the path of its other link)"
 
 [Files]
@@ -96,6 +97,7 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\screenshot.png"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSES\MPL-2.0.txt"; DestDir: "{app}\LICENSES"; Flags: ignoreversion
+Source: "..\LICENSES\PCRE2.txt"; DestDir: "{app}\LICENSES"; Flags: ignoreversion
 Source: "icon\PluginShellExtension.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
@@ -367,6 +369,17 @@ begin
   CallDllInstall(Install, 'views');
 end;
 
+function SearchMenuRegistered: Boolean;
+begin
+  Result := RegKeyExists(HKCU, 'Software\Classes\Directory\shellex\ContextMenuHandlers\PluginShellExtensionSearch');
+end;
+
+// Adds (or removes) it for this user: DllInstall with "search".
+procedure RunSearchRegistration(Install: Boolean);
+begin
+  CallDllInstall(Install, 'search');
+end;
+
 function PapyrusMenuRegistered: Boolean;
 begin
   Result := RegKeyExists(HKCU, 'Software\Classes\SystemFileAssociations\.pex\shellex\ContextMenuHandlers\PluginShellExtensionPapyrus');
@@ -412,6 +425,10 @@ begin
       RunFolderViewsRegistration(True)
     else if FolderViewsRegistered then
       RunFolderViewsRegistration(False);
+    if WizardIsTaskSelected('search') then
+      RunSearchRegistration(True)
+    else if SearchMenuRegistered then
+      RunSearchRegistration(False);
     if WizardIsTaskSelected('papyrus') then
       RunPapyrusRegistration(True)
     else if PapyrusMenuRegistered then
@@ -441,6 +458,8 @@ begin
       RunHashRegistration(False);
     if FolderViewsRegistered then
       RunFolderViewsRegistration(False);
+    if SearchMenuRegistered then
+      RunSearchRegistration(False);
     if PapyrusMenuRegistered then
       RunPapyrusRegistration(False);
     if BsaBrowseRegistered then

@@ -75,6 +75,9 @@ inline constexpr GUID kClsidPapyrusMenu = {0x3a9e7c41, 0x5b2d, 0x4f86, {0xa1, 0x
 inline constexpr wchar_t kPapyrusMenuClsidString[] = L"{3A9E7C41-5B2D-4F86-A1C3-8E6D0F2B7A15}";
 inline constexpr GUID kClsidFolderViewsMenu = {0x7b1e4a90, 0x2c6f, 0x4d13, {0x9e, 0x47, 0x15, 0xa8, 0xd3, 0x6c, 0x02, 0xf1}};
 inline constexpr wchar_t kFolderViewsMenuClsidString[] = L"{7B1E4A90-2C6F-4D13-9E47-15A8D36C02F1}";
+// "Search text..." on folders, drives, folder backgrounds and .bsa files.
+inline constexpr GUID kClsidSearchMenu = {0x6b9b6f9f, 0xcd70, 0x4390, {0xbb, 0xa9, 0xa6, 0xa3, 0xd7, 0x1e, 0x9d, 0x87}};
+inline constexpr wchar_t kSearchMenuClsidString[] = L"{6B9B6F9F-CD70-4390-BBA9-A6A3D71E9D87}";
 
 bool InstallHashMenu(HKEY root, const std::wstring& classes, const std::wstring& dllPath);
 void RemoveHashMenu(HKEY root, const std::wstring& classes);
@@ -84,6 +87,9 @@ void RemovePapyrusMenu(HKEY root, const std::wstring& classes);
 // Folder views on the background of every folder.
 bool InstallFolderViewsMenu(HKEY root, const std::wstring& classes, const std::wstring& dllPath);
 void RemoveFolderViewsMenu(HKEY root, const std::wstring& classes);
+// Search text on folders, drives, folder backgrounds and .bsa files.
+bool InstallSearchMenu(HKEY root, const std::wstring& classes, const std::wstring& dllPath);
+void RemoveSearchMenu(HKEY root, const std::wstring& classes);
 
 // Register and remove the BSA folder. `classes` is the registry path of the
 // classes root and `ext` the file extension, so a test can use neither the real

@@ -3,6 +3,8 @@
 //   bsabrowsetest --direct <dll> <archive> [...]   walks each archive and reads a sample
 //   bsabrowsetest --registration                   installs and removes it in a throwaway key
 //   bsabrowsetest --open <dll> <archive> <folder> <file>   opens one file, as a double-click does
+//   bsabrowsetest --search <dll> <scope> <query> <png>   the Search text window, saved as a picture
+//   bsabrowsetest --searchmenu <dll> <temp folder> <bsa> <file>   the Search text menu, made from the DLL (no registry)
 //   bsabrowsetest --explorer <dll> <archive> <empty folder>
 //       Registers a made-up extension for the current user, opens the archive in
 //       Windows' real folder view (the same one Explorer uses), goes into a folder
@@ -330,6 +332,109 @@ int DependentsWindowShot(const wchar_t* dllPath, const wchar_t* plugin, const wc
     HMODULE dll = LoadLibraryW(dllPath);
     auto run = dll ? reinterpret_cast<int(__stdcall*)(const wchar_t*, const wchar_t*)>(GetProcAddress(dll, "PseDependentsSnapshot")) : nullptr;
     return run ? run(plugin, png) : 2;
+}
+
+// --search <dll> <scope> <query> <png>: the Search text window searches <scope> for <query>,
+// then saves a picture (png + ".txt" has the status line and the rows) and closes. Options
+// are the defaults (PSE_THEME=dark, PSE_DPI=144 change the look); nothing is remembered.
+int SearchWindowShot(const wchar_t* dllPath, const wchar_t* scope, const wchar_t* query, const wchar_t* png) {
+    HMODULE dll = LoadLibraryW(dllPath);
+    auto run = dll ? reinterpret_cast<int(__stdcall*)(const wchar_t*, const wchar_t*, const wchar_t*)>(GetProcAddress(dll, "PseSearchSnapshot")) : nullptr;
+    return run ? run(scope, query, png) : 2;
+}
+
+// --searchmenu <dll> <folder> <bsa> <file>: the "Search text…" menu as Explorer asks for it,
+// made straight from the DLL (no registry): it must be offered for a folder, a drive, the
+// background of a folder and one .bsa, and not for a plain file or a folder with no path.
+// Then it invokes the menu on <folder>, finds the window, and closes it. <folder> must be a
+// folder in the temp folder (the window runs a search there only if someone types a query).
+int SearchMenuTest(const wchar_t* dllPath, const wchar_t* folder, const wchar_t* bsa, const wchar_t* file) {
+    using Microsoft::WRL::ComPtr;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HMODULE dll = LoadLibraryW(dllPath);
+    auto get = dll ? reinterpret_cast<HRESULT(__stdcall*)(REFCLSID, REFIID, void**)>(GetProcAddress(dll, "DllGetClassObject")) : nullptr;
+    if (!get) return 2;
+    // The window must not touch the real settings: its options file goes to the temp folder.
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(ARRAYSIZE(temp), temp);
+    wchar_t full[MAX_PATH * 4] = {};
+    GetFullPathNameW(folder, ARRAYSIZE(full), full, nullptr);
+    if (_wcsnicmp(full, temp, wcslen(temp)) != 0) {
+        wprintf(L"%ls is not in %ls\n", full, temp);
+        return 2;
+    }
+    SetEnvironmentVariableW(L"PSE_SEARCH_OPTIONS_FILE", (std::wstring(temp) + L"wham_search_menu_test_options.json").c_str());
+
+    struct Asked {
+        HRESULT init = E_FAIL;
+        int added = 0, defaultOnly = 0;
+        std::wstring label;
+        ComPtr<IContextMenu> menu;
+    };
+    auto ask = [&](const wchar_t* path, bool background) {
+        Asked a;
+        ComPtr<IClassFactory> factory;
+        ComPtr<IShellExtInit> init;
+        if (FAILED(get(pse::kClsidSearchMenu, IID_PPV_ARGS(&factory))) || FAILED(factory->CreateInstance(nullptr, IID_PPV_ARGS(&init)))) return a;
+        if (background) {
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (FAILED(SHParseDisplayName(path, nullptr, &pidl, 0, nullptr))) return a;
+            a.init = init->Initialize(pidl, nullptr, nullptr);
+            CoTaskMemFree(pidl);
+        } else {
+            ComPtr<IShellItem> item;
+            ComPtr<IDataObject> data;
+            if (FAILED(SHCreateItemFromParsingName(path, nullptr, IID_PPV_ARGS(&item))) || FAILED(item->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data)))) return a;
+            a.init = init->Initialize(nullptr, data.Get(), nullptr);
+        }
+        if (FAILED(a.init)) return a;
+        init.As(&a.menu);
+        HMENU popup = CreatePopupMenu();
+        a.defaultOnly = HRESULT_CODE(a.menu->QueryContextMenu(popup, 0, 100, 200, CMF_DEFAULTONLY));
+        a.added = HRESULT_CODE(a.menu->QueryContextMenu(popup, 0, 100, 200, CMF_NORMAL));
+        wchar_t text[260] = {};
+        if (a.added) GetMenuStringW(popup, 0, text, ARRAYSIZE(text), MF_BYPOSITION);
+        a.label = text;
+        DestroyMenu(popup);
+        return a;
+    };
+    const std::wstring offered = L"Search text…";
+    Asked a = ask(folder, false);
+    Check(SUCCEEDED(a.init) && a.added == 1 && a.label == offered && a.defaultOnly == 0, L"a folder gets Search text...");
+    Asked fv = ask(folder, true);
+    Check(SUCCEEDED(fv.init) && fv.added == 1 && fv.label == offered, L"a folder background gets Search text...");
+    wchar_t drive[4] = {full[0], L':', L'\\', 0};
+    Asked dv = ask(drive, false);
+    Check(SUCCEEDED(dv.init) && dv.added == 1, L"a drive gets Search text...");
+    Asked b = ask(bsa, false);
+    Check(SUCCEEDED(b.init) && b.added == 1 && b.label == offered, L"a .bsa gets Search text...");
+    Asked f = ask(file, false);
+    Check(FAILED(f.init) || f.added == 0, L"a plain file gets nothing");
+    Asked cp = ask(L"shell:::{21EC2020-3AEA-1069-A2DD-08002B30309D}", true);  // Control Panel: no file-system path
+    Check(cp.init != S_OK || cp.added == 0, L"a folder with no file-system path gets nothing");
+
+    CMINVOKECOMMANDINFO info{sizeof(info)};
+    info.lpVerb = MAKEINTRESOURCEA(0);
+    info.nShow = SW_SHOWNORMAL;
+    Check(a.menu && SUCCEEDED(a.menu->InvokeCommand(&info)), L"invoking it succeeds");
+    HWND window = nullptr;
+    for (int i = 0; i < 100 && !window; ++i) {
+        Sleep(50);
+        window = FindWindowW(L"PluginShellExtensionSearch", nullptr);
+    }
+    wchar_t title[MAX_PATH] = {};
+    if (window) GetWindowTextW(window, title, ARRAYSIZE(title));
+    const std::wstring expected = L"Search text - " + std::filesystem::path(full).filename().wstring();
+    Check(window && expected == title, L"its window opens, titled with the folder");
+    if (window) PostMessageW(window, WM_CLOSE, 0, 0);
+    bool closed = !window;
+    for (int i = 0; i < 100 && !closed; ++i) {
+        Sleep(50);
+        closed = !IsWindow(window);
+    }
+    Check(closed, L"and closes");
+    DeleteFileW((std::wstring(temp) + L"wham_search_menu_test_options.json").c_str());
+    return g_failures ? 1 : 0;
 }
 
 // --columns <dll> <filter> <png>: the Choose WHAM columns dialog (no window to change), saved as a picture.
@@ -1109,6 +1214,15 @@ int Registration() {
     Check(Read(classes + L"*\\shellex\\ContextMenuHandlers\\PluginShellExtensionHashes", nullptr) == pse::kHashMenuClsidString, L"the hash menu is on every file");
     pse::RemoveHashMenu(HKEY_CURRENT_USER, classes);
     Check(!Exists(classes + L"*\\shellex\\ContextMenuHandlers\\PluginShellExtensionHashes"), L"uninstall removes the hash menu");
+    Check(pse::InstallSearchMenu(HKEY_CURRENT_USER, classes, L"C:\\x.dll"), L"the Search text menu installs");
+    for (const wchar_t* t : {L"Directory\\shellex", L"Directory\\Background\\shellex", L"Drive\\shellex", L"SystemFileAssociations\\.bsa\\shellex"})
+        Check(Read(classes + t + L"\\ContextMenuHandlers\\PluginShellExtensionSearch", nullptr) == pse::kSearchMenuClsidString, L"the Search text menu is on its target");
+    Check(Read(classes + L"CLSID\\" + pse::kSearchMenuClsidString + L"\\InprocServer32", nullptr) == L"C:\\x.dll", L"the Search text menu names the DLL");
+    pse::RemoveSearchMenu(HKEY_CURRENT_USER, classes);
+    Check(!Exists(classes + L"Directory\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch") && !Exists(classes + L"Directory\\Background\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch") &&
+              !Exists(classes + L"Drive\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch") && !Exists(classes + L"SystemFileAssociations\\.bsa\\shellex\\ContextMenuHandlers\\PluginShellExtensionSearch") &&
+              !Exists(classes + L"CLSID\\" + pse::kSearchMenuClsidString),
+          L"uninstall removes the Search text menu");
 
     pse::InstallBsaBrowser(HKEY_CURRENT_USER, classes, ext, L"C:\\x.dll");
     const std::wstring later = L"SomeOtherTool.bsa";
@@ -1421,6 +1535,8 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 4 && !wcscmp(argv[1], L"--papyrus")) return PapyrusList(argv[2], argv[3]);
     if (argc == 5 && !wcscmp(argv[1], L"--propswindow")) return PropsWindow(argv[2], argv[3], argv[4]);
     if (argc == 5 && !wcscmp(argv[1], L"--dependents")) return DependentsWindowShot(argv[2], argv[3], argv[4]);
+    if (argc == 6 && !wcscmp(argv[1], L"--search")) return SearchWindowShot(argv[2], argv[3], argv[4], argv[5]);
+    if (argc == 6 && !wcscmp(argv[1], L"--searchmenu")) return SearchMenuTest(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 5 && !wcscmp(argv[1], L"--columns")) return ColumnChooserShot(argv[2], argv[3], argv[4]);
     if (argc == 5 && !wcscmp(argv[1], L"--reportwindow")) return ReportWindow(argv[2], argv[3], argv[4]);
     OleInitialize(nullptr);
