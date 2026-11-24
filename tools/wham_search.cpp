@@ -233,8 +233,17 @@ int wmain(int argc, wchar_t** argv) {
     std::snprintf(secs, sizeof(secs), "%.2f s", st.seconds);
     summary += secs;
     if (st.skippedBinary) summary += "; " + std::to_string(st.skippedBinary) + " binary files skipped";
-    if (st.errors) summary += "; " + std::to_string(st.errors) + " errors (first: " + Utf8(st.firstError) + ")";
-    if (st.truncated) summary += "; truncated at the hit limit";
+    if (st.skippedCloud || st.skippedLinked) {
+        summary += "; ";
+        if (st.skippedCloud) summary += std::to_string(st.skippedCloud) + " cloud-only files";
+        if (st.skippedCloud && st.skippedLinked) summary += " and ";
+        if (st.skippedLinked) summary += std::to_string(st.skippedLinked) + " linked folders";
+        summary += " skipped";
+    }
+    if (st.regexLimitLines) summary += "; " + std::to_string(st.regexLimitLines) + " lines too complex for the regex";
+    if (st.pexCrashed) summary += "; " + Utf8(st.decompileStopped) + " (" + std::to_string(st.pexSkipped) + " scripts skipped)";
+    if (st.errors > st.pexCrashed) summary += "; " + std::to_string(st.errors - st.pexCrashed) + " errors (first: " + Utf8(st.firstError) + ")";
+    if (st.truncated) summary += st.truncatedByBytes ? "; truncated at the result memory limit" : "; truncated at the hit limit";
     if (st.cancelled) summary += "; cancelled";
     std::fprintf(stderr, "%s\n", summary.c_str());
 
@@ -249,6 +258,11 @@ int wmain(int argc, wchar_t** argv) {
         j["pexDecompiled"] = st.pexDecompiled;
         j["skippedBinary"] = st.skippedBinary;
         j["errors"] = st.errors;
+        j["pexCrashed"] = st.pexCrashed;
+        j["pexSkipped"] = st.pexSkipped;
+        j["regexLimitLines"] = st.regexLimitLines;
+        j["skippedCloud"] = st.skippedCloud;
+        j["skippedLinked"] = st.skippedLinked;
         j["seconds"] = st.seconds;
         j["done"] = st.done;
         j["cancelled"] = st.cancelled;

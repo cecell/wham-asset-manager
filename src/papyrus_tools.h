@@ -17,8 +17,13 @@ std::wstring CompiledScriptPath(const std::wstring& psc);
 // Decompiles a .pex held in memory to source text (default options, no
 // resolver), for Search text. Safe to call from any thread: a hostile script
 // that overflows the stack or crashes the decoder fails the call, not the
-// process. False with `error` set when it can't be done.
-bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error);
+// process. False with `error` set when it can't be done; `crashed` (when given)
+// says whether the failure was such a crash (the call didn't unwind: its memory
+// leaked and the decoder state may be damaged) and not an ordinary decode error.
+bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error, bool* crashed = nullptr);
+// Tests only: `hook` runs inside the guarded call, before the decode, with the .pex
+// bytes; it may fault on purpose. nullptr removes it.
+void SetDecompileTestHook(void (*hook)(const uint8_t* data, size_t size));
 
 struct PapyrusResult {
     int status = 2;  // 0 done, 1 done with warnings, 2 failed, 3 the input can't be read

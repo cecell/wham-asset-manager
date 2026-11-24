@@ -54,6 +54,7 @@ constexpr size_t kMaxRanges = 4096;           // hit ranges kept per line
 constexpr size_t kSniff = 4096;               // bytes checked for NULs
 constexpr size_t kPexBatch = 256;             // archive .pex per phase 2 item
 constexpr uint64_t kCopyMaxAgeSeconds = 24 * 3600;
+constexpr DWORD kCloudOnly = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE;
 
 using Span = std::pair<size_t, size_t>;
 
@@ -189,7 +190,12 @@ size_t QuantifierLength(const std::string& p, size_t i, int& minRep) {
         minRep = 1;
         j = i + 1;
     } else if (c == '{') {
+        // PCRE2 10.43+ allows spaces inside the braces: {2}, { 2 }, {2, 3}, { ,3}.
         size_t k = i + 1;
+        auto spaces = [&] {
+            while (k < p.size() && p[k] == ' ') ++k;
+        };
+        spaces();
         const size_t d1 = k;
         int n = 0;
         while (k < p.size() && IsDigitC(p[k])) {
@@ -197,14 +203,18 @@ size_t QuantifierLength(const std::string& p, size_t i, int& minRep) {
             ++k;
         }
         const bool hasMin = k > d1;
+        spaces();
         bool ok = false;
         if (k < p.size() && p[k] == '}' && hasMin) {
             ok = true;
         } else if (k < p.size() && p[k] == ',') {
             ++k;
+            spaces();
             const size_t d2 = k;
             while (k < p.size() && IsDigitC(p[k])) ++k;
-            if (k < p.size() && p[k] == '}' && (hasMin || k > d2)) ok = true;
+            const bool hasMax = k > d2;
+            spaces();
+            if (k < p.size() && p[k] == '}' && (hasMin || hasMax)) ok = true;
         }
         if (!ok) return 0;
         minRep = hasMin ? n : 0;
@@ -216,6 +226,22 @@ size_t QuantifierLength(const std::string& p, size_t i, int& minRep) {
     return j - i;
 }
 
+// p[i] is '{' and QuantifierLength found no quantifier there. True when it still
+// looks like one (digits, a comma or white space follow), in some syntax we don't
+// parse: the item before it may then repeat zero times, so the run ends there and
+// the braces are skipped. A '{' followed by anything else is a plain character.
+bool BraceDoubt(const std::string& p, size_t i) {
+    if (i + 1 >= p.size() || p[i] != '{') return false;
+    const char n = p[i + 1];
+    return n == ' ' || n == '\t' || n == '\r' || n == '\n' || n == ',' || IsDigitC(n);
+}
+
+// p[j] is a backslash and p[j+1] is 'Q': the index after the matching \E (or the end).
+size_t SkipQuote(const std::string& p, size_t j) {
+    const size_t e = p.find("\\E", j + 2);
+    return e == std::string::npos ? p.size() : e + 2;
+}
+
 // p[i] is '['. Returns the index after the closing ']'.
 size_t SkipClass(const std::string& p, size_t i) {
     size_t j = i + 1;
@@ -223,7 +249,7 @@ size_t SkipClass(const std::string& p, size_t i) {
     if (j < p.size() && p[j] == ']') ++j;
     while (j < p.size()) {
         if (p[j] == '\\') {
-            j += 2;
+            j = (j + 1 < p.size() && p[j + 1] == 'Q') ? SkipQuote(p, j) : j + 2;
         } else if (p[j] == '[' && j + 1 < p.size() && (p[j + 1] == ':' || p[j + 1] == '.' || p[j + 1] == '=')) {
             const std::string close = std::string(1, p[j + 1]) + "]";
             const size_t e = p.find(close, j + 2);
@@ -244,7 +270,7 @@ size_t SkipGroup(const std::string& p, size_t i) {
     while (j < p.size()) {
         const char c = p[j];
         if (c == '\\') {
-            j += 2;
+            j = (j + 1 < p.size() && p[j + 1] == 'Q') ? SkipQuote(p, j) : j + 2;
         } else if (c == '[') {
             j = SkipClass(p, j);
         } else if (c == '(') {
@@ -364,6 +390,11 @@ std::string RequiredLiteral(const std::string& p) {
                 i += q;
                 continue;
             }
+            if (BraceDoubt(p, i)) {
+                flush();
+                i = SkipTo(p, i, '}');
+                continue;
+            }
             literal = c;
             isLiteral = true;
             ++i;
@@ -375,7 +406,10 @@ std::string RequiredLiteral(const std::string& p) {
         if (isLiteral) {
             int minRep = 0;
             const size_t q = QuantifierLength(p, i, minRep);
-            if (q == 0) {
+            if (q == 0 && BraceDoubt(p, i)) {
+                flush();  // the literal may be quantified by something we can't read: leave it out
+                i = SkipTo(p, i, '}');
+            } else if (q == 0) {
                 cur.push_back(literal);
             } else {
                 if (minRep >= 1) cur.push_back(literal);
@@ -511,6 +545,7 @@ public:
     virtual ~HitSink() = default;
     virtual bool AddHit(FileCtx& file, uint32_t line, const char* text, size_t length, const std::vector<Span>& spans) = 0;
     virtual bool Stopped() const = 0;
+    virtual void RegexLimit() = 0;  // a line where the regex gave up (match, depth or heap limit)
 };
 
 size_t CountNewlines(const char* p, size_t n) { return static_cast<size_t>(std::count(p, p + n, '\n')); }
@@ -524,7 +559,13 @@ public:
         if (q.regex) {
             md_ = pcre2_match_data_create(4, nullptr);
             mc_ = pcre2_match_context_create(nullptr);
-            if (!md_ || !mc_) throw std::bad_alloc();
+            if (!md_ || !mc_) {  // a throwing constructor doesn't run the destructor
+                if (md_) pcre2_match_data_free(md_);
+                if (mc_) pcre2_match_context_free(mc_);
+                md_ = nullptr;
+                mc_ = nullptr;
+                throw std::bad_alloc();
+            }
             pcre2_set_match_limit(mc_, 1000000);
             pcre2_set_depth_limit(mc_, 1000000);
             pcre2_set_heap_limit(mc_, 20000);  // KiB
@@ -679,13 +720,18 @@ private:
     // Regex on one line (no CR/LF); fills spans_.
     void RegexLine(const char* l, size_t len) {
         spans_.clear();
-        bool sawEmpty = false;
+        bool sawEmpty = false, limited = false;
+        unsigned rounds = 0;
         std::vector<Span> all;
         for (const RegexForm& f : q_.forms) {
             size_t off = 0;
             while (off <= len) {
+                if ((++rounds & 255) == 0 && sink_.Stopped()) break;  // a long line can take minutes
                 const int rc = pcre2_match(f.code, reinterpret_cast<PCRE2_SPTR>(l), len, off, 0, md_, mc_);
-                if (rc < 0) break;  // no match, or a limit was hit: no match on this line
+                if (rc < 0) {  // no match, or a limit was hit: no match on this line
+                    if (rc != PCRE2_ERROR_NOMATCH) limited = true;
+                    break;
+                }
                 const PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md_);
                 const size_t s = ov[0], e = ov[1];
                 if (s > e || e > len) break;
@@ -700,6 +746,7 @@ private:
                 if (all.size() >= kMaxRanges) break;
             }
         }
+        if (limited) sink_.RegexLimit();
         std::sort(all.begin(), all.end());
         for (const Span& sp : all) {
             if (sp.first == sp.second && !spans_.empty()) continue;
@@ -763,7 +810,8 @@ private:
                 AddSpan(s - ls, e - ls);
                 size_t p = e;
                 size_t s2, e2;
-                while (NextMatch(p, hay, b, n, s2, e2) && s2 < le) {
+                unsigned rounds = 0;
+                while (!((++rounds & 255) == 0 && sink_.Stopped()) && NextMatch(p, hay, b, n, s2, e2) && s2 < le) {
                     AddSpan(s2 - ls, e2 - ls);
                     p = e2;
                 }
@@ -905,6 +953,54 @@ void Utf16ToUtf8(const uint8_t* d, size_t bytes, bool bigEndian, std::string& ou
     out = ToUtf8(w);
 }
 
+// bsa-reader hands out names as views into the archive's file mapping. If the file
+// goes away (a share drops, a USB drive is pulled) after the library's own guarded
+// reads, touching them raises EXCEPTION_IN_PAGE_ERROR, which C++ catch doesn't see
+// and would end Explorer. So the names are copied here, in a function with no C++
+// objects that need unwinding, and a page error becomes a status.
+enum class NameStatus { Ok, NoName, IoError, TooLong };
+
+struct NameBuf {
+    char file[1024];
+    char folder[1024];
+    size_t fileLen = 0, folderLen = 0;
+};
+
+NameStatus CopyNamesGuarded(const bsa::Reader& r, const bsa::Entry& e, NameBuf& out) noexcept {
+    __try {
+        std::string_view file, folder;
+        out.fileLen = 0;
+        out.folderLen = 0;
+        if (r.file_name(e, file) != bsa::Status::Ok) return NameStatus::NoName;
+        if (file.size() >= sizeof(out.file)) return NameStatus::TooLong;
+        std::memcpy(out.file, file.data(), file.size());
+        out.fileLen = file.size();
+        if (r.folder_name(e.folderIndex, folder) == bsa::Status::Ok && !folder.empty()) {
+            if (folder.size() >= sizeof(out.folder)) return NameStatus::TooLong;
+            std::memcpy(out.folder, folder.data(), folder.size());
+            out.folderLen = folder.size();
+        }
+        return NameStatus::Ok;
+    } __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return NameStatus::IoError;
+    }
+}
+
+// `file` is the entry's file name; `inner` its full stored path (folder\file).
+NameStatus ArchiveNames(const bsa::Reader& r, const bsa::Entry& e, std::string& file, std::string& inner) {
+    NameBuf b;
+    const NameStatus st = CopyNamesGuarded(r, e, b);
+    if (st != NameStatus::Ok) return st;
+    file.assign(b.file, b.fileLen);
+    inner.clear();
+    if (b.folderLen) {
+        inner.assign(b.folder, b.folderLen);
+        inner.push_back('\\');
+    }
+    inner += file;
+    return st;
+}
+
 // Reads an archive entry by its stored path: the hash lookup first, then a walk
 // comparing names (hashes can collide, and old tools wrote odd names).
 bool ReadArchiveEntry(const std::wstring& archive, const std::string& inner, std::vector<uint8_t>& out, std::wstring& error) {
@@ -920,10 +1016,14 @@ bool ReadArchiveEntry(const std::wstring& archive, const std::string& inner, std
         const std::string want = LowerAsciiCopy(inner);
         bool found = false;
         for (uint32_t i = 0; i < r.header().fileCount && !found; ++i) {
-            std::string_view folder, name;
-            if (r.entry(i, e) != bsa::Status::Ok || r.file_name(e, name) != bsa::Status::Ok) continue;
-            r.folder_name(e.folderIndex, folder);
-            std::string full = folder.empty() ? std::string(name) : std::string(folder) + "\\" + std::string(name);
+            std::string name, full;
+            if (r.entry(i, e) != bsa::Status::Ok) continue;
+            const NameStatus ns = ArchiveNames(r, e, name, full);
+            if (ns == NameStatus::IoError) {
+                error = L"The archive can't be read (I/O error).";
+                return false;
+            }
+            if (ns != NameStatus::Ok) continue;
             std::replace(full.begin(), full.end(), '/', '\\');
             std::string w = want;
             std::replace(w.begin(), w.end(), '/', '\\');
@@ -982,8 +1082,14 @@ struct TextSearch::Impl final : HitSink {
     std::unordered_set<std::wstring> wantW;
     std::unordered_set<std::string> wantA;
 
-    std::atomic<bool> stop{false}, cancelled{false}, truncated{false}, done{true};
+    std::atomic<bool> stop{false}, cancelled{false}, truncated{false}, truncatedByBytes{false}, done{true};
+    // Set when the search is over (stopped, or nothing left to do): what a worker still
+    // waiting for a WorkSlot watches, so it doesn't hold `done` back.
+    std::atomic<bool> slotCancel{false};
+    std::atomic<bool> decompileStopped{false};  // a decompile crashed: no more this search
     std::atomic<uint64_t> filesSearched{0}, bytesSearched{0}, archivesOpened{0}, foldersListed{0}, pexDecompiled{0}, skippedBinary{0}, errors{0};
+    std::atomic<uint64_t> pexCrashed{0}, pexSkipped{0}, regexLimitLines{0}, skippedCloud{0}, skippedLinked{0};
+    int workerCount = 0;
 
     std::mutex mu;  // queue
     std::condition_variable cv;
@@ -995,7 +1101,9 @@ struct TextSearch::Impl final : HitSink {
     std::vector<TextSearchFile> files;
     std::vector<TextSearchHit> pending;
     uint64_t hitTotal = 0;
+    size_t hitBytes = 0;  // memory the hits taken so far use (text and ranges)
     std::wstring firstError;
+    std::wstring decompileStopMessage;
 
     std::mutex pexMu;
     std::unordered_set<std::wstring> pscStems;
@@ -1015,6 +1123,7 @@ struct TextSearch::Impl final : HitSink {
 
     // -- HitSink
     bool Stopped() const override { return stop.load(std::memory_order_relaxed); }
+    void RegexLimit() override { ++regexLimitLines; }
 
     bool AddHit(FileCtx& f, uint32_t line, const char* text, size_t length, const std::vector<Span>& spans) override {
         if (Stopped()) return false;
@@ -1022,12 +1131,15 @@ struct TextSearch::Impl final : HitSink {
         h.line = line;
         BuildHit(text, length, spans, h);
         bool reachedLimit = false;
+        const size_t cost = sizeof(TextSearchHit) + h.text.size() * sizeof(wchar_t) + h.ranges.size() * sizeof(std::pair<uint32_t, uint32_t>);
         {
             std::lock_guard<std::mutex> lock(dataMu);
-            if (hitTotal >= opts.maxHits) {
+            if (hitTotal >= opts.maxHits || hitBytes + cost > opts.maxHitBytes) {
+                if (hitTotal < opts.maxHits) truncatedByBytes = true;
                 truncated = true;
                 reachedLimit = true;
             } else {
+                hitBytes += cost;
                 if (f.index < 0) {
                     TextSearchFile tf;
                     tf.display = f.display;
@@ -1052,14 +1164,28 @@ struct TextSearch::Impl final : HitSink {
     void Stop(bool byUser) {
         if (byUser && !done) cancelled = true;
         stop = true;
+        slotCancel = true;
         { std::lock_guard<std::mutex> lock(mu); }
         cv.notify_all();
     }
 
-    void AddError(const std::wstring& what) {
+    // Counts the error and keeps its text if it is the first. Never throws: it runs in
+    // catch handlers, where an allocation failure must not take the worker down.
+    void AddError(const std::wstring& what) noexcept {
         ++errors;
-        std::lock_guard<std::mutex> lock(dataMu);
-        if (firstError.empty()) firstError = what;
+        try {
+            std::lock_guard<std::mutex> lock(dataMu);
+            if (firstError.empty()) firstError = what;
+        } catch (...) {
+        }
+    }
+
+    void AddError(const std::wstring& where, const wchar_t* what) noexcept {
+        try {
+            AddError(where + what);
+        } catch (...) {
+            ++errors;
+        }
     }
 
     void Join() {
@@ -1084,19 +1210,31 @@ struct TextSearch::Impl final : HitSink {
     }
 
     // One item is done. When phase 1 drains, the .pex without a .psc become phase 2.
-    void Finish() {
-        bool wake = false;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (--outstanding == 0) {
-                if (phase == 1 && opts.decompilePex && !Stopped()) {
-                    phase = 2;
-                    QueuePhase2();
+    // The last item of the last phase also ends the slot waits.
+    void Finish() noexcept {
+        try {
+            bool wake = false;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (--outstanding == 0) {
+                    if (phase == 1 && opts.decompilePex && !Stopped()) {
+                        phase = 2;
+                        QueuePhase2();
+                    }
+                    if (outstanding == 0) slotCancel = true;
+                    wake = true;
                 }
-                wake = true;
             }
+            if (wake) cv.notify_all();
+        } catch (...) {  // phase 2 couldn't be queued: end here rather than strand the others
+            AddError(L"Out of memory while queuing scripts to decompile.");
+            try {
+                std::lock_guard<std::mutex> lock(mu);
+                if (outstanding == 0) slotCancel = true;
+            } catch (...) {
+            }
+            cv.notify_all();
         }
-        if (wake) cv.notify_all();
     }
 
     void QueuePhase2() {  // called with `mu` held
@@ -1146,7 +1284,7 @@ struct TextSearch::Impl final : HitSink {
             Worker w(*this);
             std::unique_ptr<WorkSlot> slot;
             if (opts.threads <= 0) {
-                slot = std::make_unique<WorkSlot>(WorkKind::Interactive, &stop);
+                slot = std::make_unique<WorkSlot>(WorkKind::Interactive, &slotCancel);
                 w.slot = slot.get();
             }
             if (!slot || slot->Held()) {
@@ -1159,22 +1297,27 @@ struct TextSearch::Impl final : HitSink {
                         it = std::move(queue.front());
                         queue.pop_front();
                     }
-                    try {
-                        Process(it, w);
-                    } catch (const std::bad_alloc&) {
-                        AddError(it.display + L": out of memory");
-                    } catch (...) {
-                        AddError(it.display + L": unexpected error");
+                    {
+                        struct Done {  // whatever happens in the handlers, the item is finished
+                            Impl* m;
+                            ~Done() { m->Finish(); }
+                        } fin{this};
+                        try {
+                            Process(it, w);
+                        } catch (const std::bad_alloc&) {
+                            AddError(it.display, L": out of memory");
+                        } catch (...) {
+                            AddError(it.display, L": unexpected error");
+                        }
+                        w.scanner.Trim();
                     }
-                    w.scanner.Trim();
-                    Finish();
                     if (slot) slot->Pace();
                 }
             }
         } catch (...) {
             AddError(L"A search thread couldn't start (out of memory).");
         }
-        if (--running == 0) {
+        if (--running == 0) {  // the last one out; `slotCancel` is set already unless a thread ended early
             endNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - startTime).count();
             done = true;
         }
@@ -1213,7 +1356,10 @@ struct TextSearch::Impl final : HitSink {
             if (name[0] == L'.' && (name[1] == 0 || (name[1] == L'.' && name[2] == 0))) continue;
             const bool dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             if (dir) {
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;  // junctions and symlinks
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {  // junctions and symlinks: not followed, but counted
+                    ++skippedLinked;
+                    continue;
+                }
                 if (!opts.otherText && IsSkippedFolder(name)) continue;
                 Item it;
                 it.kind = Kind::Folder;
@@ -1234,6 +1380,10 @@ struct TextSearch::Impl final : HitSink {
                 it.kind = Kind::Loose;
                 if (opts.decompilePex) stems.push_back(Lower(file.substr(0, file.size() - ext.size())));
             } else if (ext == L".pex" && opts.decompilePex) {
+                if (fd.dwFileAttributes & kCloudOnly) {
+                    ++skippedCloud;
+                    continue;
+                }
                 PexLoose p;
                 p.stem = Lower(file.substr(0, file.size() - ext.size()));
                 p.path = it.path;
@@ -1243,6 +1393,10 @@ struct TextSearch::Impl final : HitSink {
             } else if (opts.otherText && WantedLoose(ext)) {
                 it.kind = Kind::Loose;
             } else {
+                continue;
+            }
+            if (fd.dwFileAttributes & kCloudOnly) {  // reading it would download it
+                ++skippedCloud;
                 continue;
             }
             batch.push_back(std::move(it));
@@ -1258,6 +1412,7 @@ struct TextSearch::Impl final : HitSink {
 
     // The bytes of one file or entry, from memory.
     void SearchMemory(Worker& w, FileCtx& ctx, const uint8_t* d, size_t n, bool sniff) {
+        if (Stopped()) return;
         if (n == 0) {
             ++filesSearched;
             return;
@@ -1367,6 +1522,11 @@ struct TextSearch::Impl final : HitSink {
     }
 
     void SearchLoosePex(const Item& it, Worker& w) {
+        if (decompileStopped) {
+            ++pexSkipped;
+            return;
+        }
+        if (Stopped()) return;
         std::wstring error;
         if (!ReadWholeFile(it.path, w.entryBuf, kMaxEntry, error)) {
             AddError(it.display + L": " + error);
@@ -1375,11 +1535,35 @@ struct TextSearch::Impl final : HitSink {
         SearchDecompiled(w, it.path, std::string(), it.display, w.entryBuf);
     }
 
+    // The first crash ends decompiling for the rest of the search: the call never unwound,
+    // so the decoder's memory is leaked and its state can't be trusted, and every further
+    // script of the same mod would likely do the same.
+    void DecompilerCrashed(const std::wstring& display) noexcept {
+        ++pexCrashed;
+        const bool first = !decompileStopped.exchange(true);
+        ++errors;
+        if (!first) return;
+        try {
+            std::wstring text = L"Decompiling stopped after " + display + L" crashed the decompiler";
+            std::lock_guard<std::mutex> lock(dataMu);
+            decompileStopMessage = text;
+            if (firstError.empty()) firstError = text;
+        } catch (...) {
+        }
+    }
+
     void SearchDecompiled(Worker& w, const std::wstring& diskPath, const std::string& inner, const std::wstring& display, const std::vector<uint8_t>& bytes) {
+        if (decompileStopped) {
+            ++pexSkipped;
+            return;
+        }
+        if (Stopped()) return;
         std::string source;
         std::wstring error;
-        if (!DecompilePexBytes(bytes.data(), bytes.size(), source, error)) {
-            AddError(display + L" " + error);
+        bool crashed = false;
+        if (!DecompilePexBytes(bytes.data(), bytes.size(), source, error, &crashed)) {
+            if (crashed) DecompilerCrashed(display);
+            else AddError(display + L" " + error);
             return;
         }
         ++pexDecompiled;
@@ -1389,14 +1573,6 @@ struct TextSearch::Impl final : HitSink {
         w.ctx.inner = inner;
         w.ctx.decompiled = true;
         SearchMemory(w, w.ctx, reinterpret_cast<const uint8_t*>(source.data()), source.size(), false);
-    }
-
-    static bool EntryName(const bsa::Reader& r, const bsa::Entry& e, std::string& inner, std::string_view& name) {
-        std::string_view folder;
-        if (r.file_name(e, name) != bsa::Status::Ok) return false;
-        if (r.folder_name(e.folderIndex, folder) != bsa::Status::Ok) folder = {};
-        inner = folder.empty() ? std::string(name) : std::string(folder) + "\\" + std::string(name);
-        return true;
     }
 
     void SearchArchive(const Item& it, Worker& w) {
@@ -1411,18 +1587,22 @@ struct TextSearch::Impl final : HitSink {
         for (uint32_t i = 0; i < count && !Stopped(); ++i) {
             bsa::Entry e;
             if (r.entry(i, e) != bsa::Status::Ok) continue;
-            std::string_view name;
-            if (r.file_name(e, name) != bsa::Status::Ok) {
+            std::string name, inner;
+            const NameStatus ns = ArchiveNames(r, e, name, inner);
+            if (ns == NameStatus::IoError) {
+                AddError(it.display + L": the archive can't be read (I/O error)");
+                return;
+            }
+            if (ns == NameStatus::NoName) {
                 AddError(it.display + L": the archive has no usable file names");
                 return;
             }
+            if (ns != NameStatus::Ok) continue;
             const std::string ext = ExtensionOfNarrow(name);
             if (ext.empty()) continue;
             const bool psc = ext == ".psc";
             const bool pex = opts.decompilePex && ext == ".pex";
             if (!psc && !pex && !(opts.otherText && wantA.count(ext))) continue;
-            std::string inner;
-            EntryName(r, e, inner, name);
             const std::wstring innerW = BackslashPath(Widen(inner));
             if (psc || pex) {
                 if (opts.decompilePex) {
@@ -1454,6 +1634,10 @@ struct TextSearch::Impl final : HitSink {
     }
 
     void SearchArchivePex(const Item& it, Worker& w) {
+        if (decompileStopped) {
+            pexSkipped += it.entries->size();
+            return;
+        }
         bsa::Reader r;
         const bsa::Status s = r.open(fs::path(LongPath(it.path)));
         if (s != bsa::Status::Ok) {
@@ -1463,10 +1647,19 @@ struct TextSearch::Impl final : HitSink {
         ++archivesOpened;
         for (uint32_t index : *it.entries) {
             if (Stopped()) break;
+            if (decompileStopped) {
+                ++pexSkipped;
+                continue;
+            }
             bsa::Entry e;
-            std::string inner;
-            std::string_view name;
-            if (r.entry(index, e) != bsa::Status::Ok || !EntryName(r, e, inner, name)) continue;
+            std::string name, inner;
+            if (r.entry(index, e) != bsa::Status::Ok) continue;
+            const NameStatus ns = ArchiveNames(r, e, name, inner);
+            if (ns == NameStatus::IoError) {
+                AddError(it.display + L": the archive can't be read (I/O error)");
+                return;
+            }
+            if (ns != NameStatus::Ok) continue;
             const std::wstring display = it.display + L"\\" + BackslashPath(Widen(inner));
             const bsa::Status rs = r.read(e, w.entryBuf, kMaxEntry);
             if (rs != bsa::Status::Ok) {
@@ -1538,7 +1731,8 @@ bool TextSearch::Start(const std::wstring& rootIn, const TextSearchOptions& opti
         m.wantA.insert(LowerAsciiCopy(ToUtf8(ext)));
     }
 
-    int count = options.threads > 0 ? std::clamp(options.threads, 1, 16) : std::clamp(WorkerLimit(), 1, 16);
+    // Budget mode leaves one slot free for Background work.
+    int count = options.threads > 0 ? std::clamp(options.threads, 1, 16) : std::clamp(std::max(1, WorkerLimit() - 1), 1, 16);
     m.done = false;
     m.outstanding = 1;
     m.queue.push_back(std::move(first));
@@ -1552,6 +1746,7 @@ bool TextSearch::Start(const std::wstring& rootIn, const TextSearchOptions& opti
         return fail(L"Couldn't start the search threads.");
     }
     m.running = static_cast<int>(m.threads.size());
+    m.workerCount = m.running;
     m.startTime = std::chrono::steady_clock::now();
     for (HANDLE h : m.threads) ResumeThread(h);
     return true;
@@ -1594,6 +1789,13 @@ TextSearchStats TextSearch::Stats() const {
     s.pexDecompiled = m.pexDecompiled;
     s.skippedBinary = m.skippedBinary;
     s.errors = m.errors;
+    s.pexCrashed = m.pexCrashed;
+    s.pexSkipped = m.pexSkipped;
+    s.regexLimitLines = m.regexLimitLines;
+    s.skippedCloud = m.skippedCloud;
+    s.skippedLinked = m.skippedLinked;
+    s.workers = m.workerCount;
+    s.truncatedByBytes = m.truncatedByBytes;
     s.done = m.done;
     s.cancelled = m.cancelled;
     s.truncated = m.truncated;
@@ -1602,6 +1804,7 @@ TextSearchStats TextSearch::Stats() const {
         s.hits = m.hitTotal;
         s.filesWithHits = m.files.size();
         s.firstError = m.firstError;
+        s.decompileStopped = m.decompileStopMessage;
     }
     const int64_t end = m.endNanos;
     s.seconds = end >= 0 ? static_cast<double>(end) / 1e9
@@ -1663,6 +1866,61 @@ std::vector<std::wstring> SplitPath(const std::wstring& path) {
     return parts;
 }
 
+// Writes `bytes` to a new file in the target's folder, then renames it over the target
+// (so a reader never sees half a file) and makes it read-only. Another WHAM window can
+// be writing the same copy at the same moment: when the rename fails but the target
+// already holds exactly these bytes, that is as good as success.
+bool WriteCopyAtomically(const std::wstring& target, const std::string& bytes, std::wstring& error) {
+    const std::wstring lp = LongPath(target);
+    const std::wstring tmp = target + L"." + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetCurrentThreadId()) + L"-" +
+                             std::to_wstring(GetTickCount64()) + L".tmp";
+    const std::wstring ltmp = LongPath(tmp);
+    HANDLE h = CreateFileW(ltmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        error = L"Can't write " + target + L": " + WindowsError(GetLastError());
+        return false;
+    }
+    bool ok = true;
+    size_t done = 0;
+    while (done < bytes.size() && ok) {
+        DWORD wrote = 0;
+        const DWORD want = static_cast<DWORD>(std::min<size_t>(bytes.size() - done, 16u << 20));
+        ok = WriteFile(h, bytes.data() + done, want, &wrote, nullptr) && wrote == want;
+        done += wrote;
+    }
+    DWORD code = ok ? 0 : GetLastError();
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(ltmp.c_str());
+        error = L"Can't write " + target + L": " + WindowsError(code);
+        return false;
+    }
+    // Another window may be doing the same right now: a rename can fail while it holds the
+    // target read-only or is replacing it. Try again a few times; the target holding exactly
+    // these bytes is as good as writing it.
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        const DWORD attrs = GetFileAttributesW(lp.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) SetFileAttributesW(lp.c_str(), attrs & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY));
+        if (MoveFileExW(ltmp.c_str(), lp.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            SetFileAttributesW(lp.c_str(), FILE_ATTRIBUTE_READONLY);
+            return true;
+        }
+        code = GetLastError();
+        std::vector<uint8_t> now;
+        std::wstring ignore;
+        if (ReadWholeFile(target, now, bytes.size() + 1, ignore) && now.size() == bytes.size() &&
+            (bytes.empty() || std::memcmp(now.data(), bytes.data(), bytes.size()) == 0)) {
+            DeleteFileW(ltmp.c_str());
+            SetFileAttributesW(lp.c_str(), FILE_ATTRIBUTE_READONLY);
+            return true;
+        }
+        Sleep(15u * static_cast<DWORD>(attempt + 1));
+    }
+    DeleteFileW(ltmp.c_str());
+    error = L"Can't write " + target + L": " + WindowsError(code);
+    return false;
+}
+
 bool MakeFolders(const std::wstring& folder) {
     std::wstring so_far;
     for (const std::wstring& part : SplitPath(folder)) {
@@ -1675,6 +1933,17 @@ bool MakeFolders(const std::wstring& folder) {
 }
 
 }  // namespace
+
+std::wstring SearchCopyHash(const std::wstring& fullPath) {
+    uint32_t h = 2166136261u;
+    for (wchar_t c : Lower(fullPath)) {
+        h = (h ^ (static_cast<uint32_t>(c) & 0xFF)) * 16777619u;
+        h = (h ^ ((static_cast<uint32_t>(c) >> 8) & 0xFF)) * 16777619u;
+    }
+    wchar_t out[16];
+    swprintf_s(out, L"%08x", h);
+    return out;
+}
 
 bool WriteSearchCopy(const TextSearchFile& file, std::wstring& path, std::wstring& error) {
     if (file.inner.empty() && !file.decompiled) {
@@ -1689,14 +1958,15 @@ bool WriteSearchCopy(const TextSearchFile& file, std::wstring& path, std::wstrin
     // Names from the archive are untrusted: every piece must be a plain file name.
     std::wstring archiveName, folder = top;
     std::wstring leaf;
+    const std::wstring hash = SearchCopyHash(file.diskPath);  // told apart by where the archive (or the .pex) is
     if (!file.inner.empty()) {
         archiveName = LeafOf(file.diskPath);
         std::vector<std::wstring> parts = SplitPath(Widen(file.inner));
-        if (!SafeName(archiveName)) {
+        if (!SafeName(archiveName) || !SafeName(archiveName + L" " + hash)) {
             error = L"The archive name isn't a safe file name.";
             return false;
         }
-        folder += L"\\" + archiveName;
+        folder += L"\\" + archiveName + L" " + hash;
         for (size_t i = 0; i + 1 < parts.size(); ++i) {
             if (!SafeName(parts[i])) {
                 error = L"The path inside the archive isn't safe to write.";
@@ -1706,7 +1976,7 @@ bool WriteSearchCopy(const TextSearchFile& file, std::wstring& path, std::wstrin
         }
         leaf = parts.back();
     } else {
-        folder += L"\\decompiled";
+        folder += L"\\decompiled " + hash;
         leaf = LeafOf(file.diskPath);
     }
     if (!SafeName(leaf)) {
@@ -1742,29 +2012,7 @@ bool WriteSearchCopy(const TextSearchFile& file, std::wstring& path, std::wstrin
             return true;
         }
     }
-    const std::wstring lp = LongPath(target);
-    const DWORD attrs = GetFileAttributesW(lp.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) SetFileAttributesW(lp.c_str(), attrs & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY));
-    HANDLE h = CreateFileW(lp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        error = L"Can't write " + target + L": " + WindowsError(GetLastError());
-        return false;
-    }
-    bool ok = true;
-    size_t done = 0;
-    while (done < bytes.size() && ok) {
-        DWORD wrote = 0;
-        const DWORD want = static_cast<DWORD>(std::min<size_t>(bytes.size() - done, 16u << 20));
-        ok = WriteFile(h, bytes.data() + done, want, &wrote, nullptr) && wrote == want;
-        done += wrote;
-    }
-    const DWORD code = GetLastError();
-    CloseHandle(h);
-    if (!ok) {
-        error = L"Can't write " + target + L": " + WindowsError(code);
-        return false;
-    }
-    SetFileAttributesW(lp.c_str(), FILE_ATTRIBUTE_READONLY);
+    if (!WriteCopyAtomically(target, bytes, error)) return false;
     path = target;
     return true;
 }
@@ -1817,6 +2065,43 @@ void CleanUpSearchCopies() {
     GetSystemTimeAsFileTime(&now);
     bool removed = false;
     CleanFolder(top, (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime, removed);
+}
+
+namespace {
+
+// Removes everything in `folder`, then the folder. Links are removed as links, never
+// entered, so nothing outside the tree is touched.
+void DeleteTree(const std::wstring& folder) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(LongPath(folder + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..") continue;
+            const std::wstring full = LongPath(folder + L"\\" + name);
+            const bool dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool link = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            if (dir && !link) {
+                DeleteTree(folder + L"\\" + name);
+                continue;
+            }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(full.c_str(), fd.dwFileAttributes & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY));
+            if (dir) RemoveDirectoryW(full.c_str());  // a junction or directory symlink: the link only
+            else DeleteFileW(full.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(LongPath(folder).c_str());
+}
+
+}  // namespace
+
+void DeleteAllSearchCopies() {
+    const std::wstring top = SearchCopyRoot();
+    if (top.empty()) return;
+    const DWORD attrs = GetFileAttributesW(LongPath(top).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return;
+    DeleteTree(top);
 }
 
 // ---------------------------------------------------------------- editor
@@ -1877,7 +2162,21 @@ std::wstring FindNotepadPlusPlus() {
     return {};
 }
 
+// The system Notepad, by full path (never found through the PATH or the shell).
+std::wstring SystemNotepad() {
+    wchar_t dir[MAX_PATH] = {};
+    for (int which = 0; which < 2; ++which) {
+        const UINT n = which == 0 ? GetWindowsDirectoryW(dir, static_cast<UINT>(std::size(dir))) : GetSystemDirectoryW(dir, static_cast<UINT>(std::size(dir)));
+        if (n == 0 || n >= std::size(dir)) continue;
+        const std::wstring p = JoinPath(std::wstring(dir, n), L"notepad.exe");
+        if (FileExists(p)) return p;
+    }
+    return {};
+}
+
 bool OpenInEditor(const std::wstring& path, uint32_t line, std::wstring& error) {
+    // Never the shell's "open" verb: the mask is the user's, and a hit in a .py, .jar,
+    // .html or .ahk would be run or rendered, not shown. Notepad++ or Notepad, nothing else.
     const std::wstring npp = FindNotepadPlusPlus();
     if (!npp.empty()) {
         std::wstring cmd = L"\"" + npp + L"\"";
@@ -1885,21 +2184,9 @@ bool OpenInEditor(const std::wstring& path, uint32_t line, std::wstring& error) 
         cmd += L" \"" + path + L"\"";
         if (Launch(cmd)) return true;
     }
-    // The mask is the user's: a .bat or .js added to it must be shown, never run.
-    if (AssocIsDangerous(PathFindExtensionW(path.c_str()))) {
-        if (Launch(L"notepad.exe \"" + path + L"\"")) return true;
-        error = L"Couldn't open " + path + L": " + WindowsError(GetLastError());
-        return false;
-    }
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_FLAG_NO_UI;
-    sei.lpVerb = L"open";
-    sei.lpFile = path.c_str();
-    sei.nShow = SW_SHOWNORMAL;
-    if (ShellExecuteExW(&sei)) return true;
-    if (Launch(L"notepad.exe \"" + path + L"\"")) return true;
-    error = L"Couldn't open " + path + L": " + WindowsError(GetLastError());
+    const std::wstring notepad = SystemNotepad();
+    if (!notepad.empty() && Launch(L"\"" + notepad + L"\" \"" + path + L"\"")) return true;
+    error = L"Couldn't open " + path + L": " + (notepad.empty() ? std::wstring(L"Notepad wasn't found") : WindowsError(GetLastError()));
     return false;
 }
 

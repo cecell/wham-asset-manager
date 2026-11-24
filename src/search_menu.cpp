@@ -15,15 +15,36 @@ namespace {
 
 bool IsBsa(const std::wstring& path) { return _wcsicmp(PathFindExtensionW(path.c_str()), L".bsa") == 0; }
 
-bool IsDirectory(const std::wstring& path) {
-    const DWORD a = GetFileAttributesW(path.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+// This runs on Explorer's own thread for every right-click on a folder, drive or
+// .bsa: nothing here may touch the disk (GetFileAttributesW on a dropped network
+// drive waits for its timeout). The shell item already knows: it was built from the
+// folder's listing.
+// A real folder: SFGAO_FOLDER on the file system, and not a stream (a .zip is both).
+bool ItemIsFileFolder(IDataObject* data) {
+    IShellItemArray* items = nullptr;
+    if (FAILED(SHCreateShellItemArrayFromDataObject(data, IID_PPV_ARGS(&items))) || !items) return false;
+    bool folder = false;
+    DWORD count = 0;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(items->GetCount(&count)) && count == 1 && SUCCEEDED(items->GetItemAt(0, &item)) && item) {
+        SFGAOF attrs = 0;
+        item->GetAttributes(SFGAO_FOLDER | SFGAO_FILESYSTEM | SFGAO_STREAM, &attrs);  // S_FALSE when not all are set: read `attrs`
+        folder = (attrs & SFGAO_FOLDER) && (attrs & SFGAO_FILESYSTEM) && !(attrs & SFGAO_STREAM);
+        item->Release();
+    }
+    items->Release();
+    return folder;
 }
 
-bool IsFile(const std::wstring& path) {
-    const DWORD a = GetFileAttributesW(path.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
-}
+// A locked and released CF_HDROP, even when something throws.
+struct DropMedium {
+    STGMEDIUM stg{};
+    HDROP drop = nullptr;
+    ~DropMedium() {
+        if (drop) GlobalUnlock(stg.hGlobal);
+        ReleaseStgMedium(&stg);
+    }
+};
 
 class SearchMenu final : public IShellExtInit, public IContextMenu {
 public:
@@ -57,25 +78,24 @@ public:
         try {
             if (!data) {
                 wchar_t buf[MAX_PATH * 2] = {};
+                // The handler is registered under Directory\Background, so this is a
+                // folder; a pidl with no file-system path (inside a .bsa) fails here.
                 if (!folder || !SHGetPathFromIDListEx(folder, buf, ARRAYSIZE(buf), GPFIDL_DEFAULT)) return E_FAIL;
-                if (!IsDirectory(buf)) return E_FAIL;
                 path_ = buf;
                 return S_OK;
             }
             FORMATETC fe{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-            STGMEDIUM stg{};
-            if (FAILED(data->GetData(&fe, &stg))) return E_INVALIDARG;
-            if (auto drop = static_cast<HDROP>(GlobalLock(stg.hGlobal))) {
-                if (DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) == 1) {
-                    const UINT len = DragQueryFileW(drop, 0, nullptr, 0);
-                    std::wstring path(len + 1, L' ');
-                    DragQueryFileW(drop, 0, path.data(), len + 1);
-                    path.resize(len);
-                    if (IsDirectory(path) || (IsBsa(path) && IsFile(path))) path_ = std::move(path);
-                }
-                GlobalUnlock(stg.hGlobal);
+            DropMedium m;
+            if (FAILED(data->GetData(&fe, &m.stg))) return E_INVALIDARG;
+            m.drop = static_cast<HDROP>(GlobalLock(m.stg.hGlobal));
+            if (m.drop && DragQueryFileW(m.drop, 0xFFFFFFFF, nullptr, 0) == 1) {
+                const UINT len = DragQueryFileW(m.drop, 0, nullptr, 0);
+                std::wstring path(len + 1, L' ');
+                DragQueryFileW(m.drop, 0, path.data(), len + 1);
+                path.resize(len);
+                // A .bsa is taken by its name; anything else only if the shell says it is a folder.
+                if (IsBsa(path) || ItemIsFileFolder(data)) path_ = std::move(path);
             }
-            ReleaseStgMedium(&stg);
         } catch (...) {
             path_.clear();
             return E_OUTOFMEMORY;
@@ -91,7 +111,7 @@ public:
 
     IFACEMETHODIMP InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
         if (!info) return E_POINTER;
-        if (HIWORD(info->lpVerb)) return E_INVALIDARG;
+        if (!IS_INTRESOURCE(info->lpVerb)) return E_INVALIDARG;
         if (LOWORD(info->lpVerb) != 0 || path_.empty()) return E_INVALIDARG;
         try {
             ShowSearchWindowAsync(path_);

@@ -5,6 +5,7 @@
 #include <malloc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -312,7 +313,14 @@ PapyrusResult PapyrusWorkspace::Guarded(bool compile, const std::wstring& input,
     return failed;
 }
 
-bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error) {
+namespace {
+std::atomic<void (*)(const uint8_t*, size_t)> g_decompileHook{nullptr};
+}
+
+void SetDecompileTestHook(void (*hook)(const uint8_t* data, size_t size)) { g_decompileHook = hook; }
+
+bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error, bool* crashed) {
+    if (crashed) *crashed = false;
     struct Call {
         const uint8_t* data;
         size_t size;
@@ -323,6 +331,7 @@ bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, st
     const bool finished = RunGuarded(
         [](void* context) {
             auto& c = *static_cast<Call*>(context);
+            if (auto hook = g_decompileHook.load()) hook(c.data, c.size);
             try {
                 pex::Script script;
                 std::string message;
@@ -339,6 +348,7 @@ bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, st
         },
         &call);
     if (!finished) {
+        if (crashed) *crashed = true;
         error = L"is too damaged or too deeply nested to decompile";
         return false;
     }

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -31,6 +32,9 @@ constexpr wchar_t kSearchClass[] = L"PluginShellExtensionSearch";
 constexpr UINT WM_APP_OPENED = WM_APP + 10;  // an open worker finished (error text in the shared state)
 constexpr UINT WM_APP_SNAP = WM_APP + 11;    // tests: the search is done, save the picture
 constexpr UINT WM_APP_FIT = WM_APP + 12;     // a column edge was dragged: refit the Text column
+constexpr UINT WM_APP_COPIED = WM_APP + 13;  // the Copy results worker finished (text in the shared state)
+constexpr size_t kClipboardChars = (size_t{64} << 20) / sizeof(wchar_t);  // Copy results is cut at 64 MB
+constexpr SIZE_T kThreadStack = size_t{8} << 20;  // as the search workers: a script the search decompiled must open
 constexpr UINT_PTR kTimerCopied = 1, kTimerTick = 2;
 constexpr UINT kTickMs = 100;
 
@@ -138,6 +142,134 @@ std::wstring ScopeTitleName(const std::wstring& scope) {
     return (leaf && *leaf && s.size() > 3) ? std::wstring(leaf) : s;
 }
 
+// The rows of one search. Shared with the Copy results worker, so a new search can
+// replace the window's set while a copy still reads the old one.
+struct ResultSet {
+    std::vector<TextSearchHit> hits;
+    std::vector<TextSearchFile> files;
+};
+
+// "file:line:text" per row after `header`, stopping before `capChars` would be passed.
+std::wstring BuildResults(const std::wstring& header, const ResultSet& set, size_t capChars, bool* cut, size_t* lines) {
+    std::wstring text = header;
+    size_t n = 0;
+    if (cut) *cut = false;
+    for (const TextSearchHit& h : set.hits) {
+        const std::wstring& name = h.file < set.files.size() ? set.files[h.file].display : std::wstring();
+        const size_t need = name.size() + h.text.size() + 16;
+        if (text.size() + need > capChars) {
+            if (cut) *cut = true;
+            break;
+        }
+        text += name;
+        text += L':';
+        text += std::to_wstring(h.line);
+        text += L':';
+        text += h.text;
+        text += L"\r\n";
+        ++n;
+    }
+    if (lines) *lines = n;
+    return text;
+}
+
+// What a Copy results worker hands back: the clipboard block, built off the window's thread.
+struct CopyState {
+    std::mutex lock;
+    HGLOBAL mem = nullptr;
+    bool cut = false, failed = false;
+    size_t lines = 0, total = 0;
+    uint64_t generation = 0;
+    ~CopyState() {
+        if (mem) GlobalFree(mem);
+    }
+};
+
+struct CopyArgs {
+    std::shared_ptr<ResultSet> results;
+    std::wstring header;
+    std::shared_ptr<CopyState> state;
+    HWND hwnd;
+    HMODULE module;
+};
+
+DWORD WINAPI CopyThread(void* param) {
+    std::unique_ptr<CopyArgs> a(static_cast<CopyArgs*>(param));
+    try {
+        bool cut = false;
+        size_t lines = 0;
+        bool failed = false;
+        HGLOBAL mem = nullptr;
+        try {
+            std::wstring text = BuildResults(a->header, *a->results, kClipboardChars, &cut, &lines);
+            const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+            mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if (mem) {
+                if (void* p = GlobalLock(mem)) {
+                    memcpy(p, text.c_str(), bytes);
+                    GlobalUnlock(mem);
+                } else {
+                    GlobalFree(mem);
+                    mem = nullptr;
+                }
+            }
+            failed = mem == nullptr;
+        } catch (...) {  // std::bad_alloc: the text didn't fit in memory
+            failed = true;
+        }
+        {
+            std::lock_guard<std::mutex> g(a->state->lock);
+            a->state->mem = mem;
+            a->state->cut = cut;
+            a->state->failed = failed;
+            a->state->lines = lines;
+            a->state->total = a->results->hits.size();
+        }
+        PostMessageW(a->hwnd, WM_APP_COPIED, 0, 0);
+    } catch (...) {
+    }
+    HMODULE module = a->module;
+    a.reset();
+    FreeLibraryAndExitThread(module, 0);
+}
+
+// A search being thrown away: cancelled at once, then destroyed (which waits for its
+// workers, possibly a long time on a dead network share) on a thread of its own, so the
+// window never hangs on it.
+struct ReaperArgs {
+    std::unique_ptr<TextSearch> search;
+    HMODULE module;
+};
+
+DWORD WINAPI ReaperThread(void* param) {
+    std::unique_ptr<ReaperArgs> a(static_cast<ReaperArgs*>(param));
+    HMODULE module = a->module;
+    try {
+        a->search.reset();
+    } catch (...) {
+    }
+    a.reset();
+    FreeLibraryAndExitThread(module, 0);
+}
+
+void RetireSearch(std::unique_ptr<TextSearch>& search) {
+    if (!search) return;
+    search->Cancel();
+    HMODULE module = AddModuleRef();
+    auto* args = new (std::nothrow) ReaperArgs{nullptr, module};
+    if (module && args) {
+        args->search = std::move(search);
+        if (HANDLE t = CreateThread(nullptr, 0, &ReaperThread, args, 0, nullptr)) {
+            CloseHandle(t);
+            return;
+        }
+        search = std::move(args->search);
+    }
+    delete args;
+    if (module) FreeLibrary(module);
+    search.reset();  // no thread to hand it to: wait here
+}
+
 // What an open worker tells the window.
 struct OpenState {
     std::mutex lock;
@@ -182,9 +314,9 @@ DWORD WINAPI CleanUpThread(void* param) {
 // Runs `routine` on a new thread. `module` is the reference AddModuleRef took, which the
 // thread gives back with FreeLibraryAndExitThread; false (reference released) if it
 // couldn't start.
-bool StartThread(LPTHREAD_START_ROUTINE routine, void* arg, HMODULE module) {
+bool StartThread(LPTHREAD_START_ROUTINE routine, void* arg, HMODULE module, SIZE_T stack = 0) {
     if (!module) return false;
-    if (HANDLE t = CreateThread(nullptr, 0, routine, arg, 0, nullptr)) {
+    if (HANDLE t = CreateThread(nullptr, stack, routine, arg, stack ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, nullptr)) {
         CloseHandle(t);
         return true;
     }
@@ -401,13 +533,12 @@ private:
 
     const TextSearchFile& FileOf(const TextSearchHit& h) const {
         static const TextSearchFile none;
-        return h.file < files_.size() ? files_[h.file] : none;
+        return h.file < res_->files.size() ? res_->files[h.file] : none;
     }
 
+    // Tests: every row, as Copy results would put it.
     std::wstring ResultsText() const {
-        std::wstring text = L"Search \"" + lastQuery_ + L"\" in " + lastScope_ + L"\r\n";
-        for (const TextSearchHit& h : hits_) text += FileOf(h).display + L":" + std::to_wstring(h.line) + L":" + h.text + L"\r\n";
-        return text;
+        return BuildResults(L"Search \"" + lastQuery_ + L"\" in " + lastScope_ + L"\r\n", *res_, static_cast<size_t>(-1), nullptr, nullptr);
     }
 
     void SetStatus(const std::wstring& text, bool bad = false) {
@@ -428,7 +559,7 @@ private:
     void SetRunning(bool running) {
         running_ = running;
         EnableWindow(cancel_, running);
-        EnableWindow(copy_, !running && !hits_.empty());
+        UpdateCopyButton();
     }
 
     void StartSearch() {
@@ -441,11 +572,12 @@ private:
         std::wstring scope = Trim(WindowText(in_));
         if (scope.size() >= 2 && scope.front() == L'"' && scope.back() == L'"') scope = Trim(scope.substr(1, scope.size() - 2));
         while (scope.size() > 3 && (scope.back() == L'\\' || scope.back() == L'/')) scope.pop_back();
-        // A new search replaces the old one: stop it first (the destructor cancels and waits).
+        // A new search replaces the old one: it is cancelled now and destroyed on another
+        // thread. Its late hits stay in its own object; the list never sees them.
         KillTimer(hwnd_, kTimerTick);
-        search_.reset();
-        hits_.clear();
-        files_.clear();
+        RetireSearch(search_);
+        res_ = std::make_shared<ResultSet>();
+        ++copyGeneration_;
         ListView_SetItemCountEx(list_, 0, 0);
         FitColumns();
         InvalidateRect(list_, nullptr, TRUE);
@@ -462,6 +594,7 @@ private:
         o.extraExtensions = ParseExtensionList(chosen.extensions.empty() ? DefaultExtraExtensionsText() : chosen.extensions);
         o.decompilePex = chosen.decompilePex;
         maxHits_ = o.maxHits;
+        maxHitBytes_ = o.maxHitBytes;
         lastQuery_ = query;
         lastScope_ = scope;
         const std::wstring title = L"Search text - " + ScopeTitleName(scope);
@@ -471,7 +604,7 @@ private:
         if (!search_->Start(scope, o)) {
             const std::wstring error = search_->Stats().firstError;
             SetResultStatus(error.empty() ? L"The search couldn't start." : error, true);
-            search_.reset();
+            RetireSearch(search_);
             if (!png_.empty()) PostMessageW(hwnd_, WM_APP_SNAP, 0, 0);
             return;
         }
@@ -496,10 +629,10 @@ private:
     }
 
     void TakeNewHits() {
-        const size_t before = hits_.size();
-        search_->TakeHits(hits_);
-        for (size_t i = before; i < hits_.size(); ++i)
-            while (files_.size() <= hits_[i].file) files_.push_back(search_->File(static_cast<uint32_t>(files_.size())));
+        const size_t before = res_->hits.size();
+        search_->TakeHits(res_->hits);
+        for (size_t i = before; i < res_->hits.size(); ++i)
+            while (res_->files.size() <= res_->hits[i].file) res_->files.push_back(search_->File(static_cast<uint32_t>(res_->files.size())));
     }
 
     void OnTick() {
@@ -507,8 +640,8 @@ private:
         const TextSearchStats s = search_->Stats();  // read before the hits: done means every hit is already there
         TakeNewHits();
         if (!s.done) {
-            if (hits_.size() != static_cast<size_t>(ListView_GetItemCount(list_))) {
-                ListView_SetItemCountEx(list_, static_cast<int>(hits_.size()), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+            if (res_->hits.size() != static_cast<size_t>(ListView_GetItemCount(list_))) {
+                ListView_SetItemCountEx(list_, static_cast<int>(res_->hits.size()), LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
                 FitColumns();  // the vertical scroll bar may have appeared
             }
             UpdateRunningStatus(s);
@@ -530,11 +663,27 @@ private:
              Count(s.archivesOpened, L"archive", L"archives");
         if (s.pexDecompiled) t += L", " + Count(s.pexDecompiled, L"script", L"scripts") + L" decompiled";
         t += L" · " + OneDecimal(s.seconds) + L" s";
-        if (s.truncated) t += L" · Stopped at " + Num(maxHits_) + L" lines";
-        if (s.errors) {
-            t += L" · " + Num(s.errors) + L" couldn't be read";
-            if (!s.firstError.empty()) t += L" (first: " + s.firstError + L")";
-        } else if (!s.firstError.empty()) {
+        if (s.truncated) {
+            if (s.truncatedByBytes) t += L" · Stopped at " + OneDecimal(static_cast<double>(maxHitBytes_) / (1024.0 * 1024.0)) + L" MB of results";
+            else t += L" · Stopped at " + Num(maxHits_) + L" lines";
+        }
+        if (s.skippedCloud || s.skippedLinked) {
+            t += L" · ";
+            if (s.skippedCloud) t += Count(s.skippedCloud, L"cloud-only file", L"cloud-only files");
+            if (s.skippedCloud && s.skippedLinked) t += L" and ";
+            if (s.skippedLinked) t += Count(s.skippedLinked, L"linked folder", L"linked folders");
+            t += L" skipped";
+        }
+        if (s.regexLimitLines) t += L" · " + Count(s.regexLimitLines, L"line", L"lines") + L" too complex for the regex";
+        if (!s.decompileStopped.empty()) {
+            t += L" · " + s.decompileStopped;
+            if (s.pexSkipped) t += L" (" + Count(s.pexSkipped, L"script", L"scripts") + L" skipped)";
+        }
+        const uint64_t plain = s.errors > s.pexCrashed ? s.errors - s.pexCrashed : 0;
+        if (plain) {
+            t += L" · " + Num(plain) + L" couldn't be read";
+            if (!s.firstError.empty() && s.firstError != s.decompileStopped) t += L" (first: " + s.firstError + L")";
+        } else if (!s.firstError.empty() && s.firstError != s.decompileStopped) {
             t += L" · " + s.firstError;
         }
         return t;
@@ -544,27 +693,27 @@ private:
     void SortHits() {
         const int selected = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
         uint32_t keyFile = 0, keyLine = 0;
-        const bool hadSelection = selected >= 0 && static_cast<size_t>(selected) < hits_.size();
+        const bool hadSelection = selected >= 0 && static_cast<size_t>(selected) < res_->hits.size();
         if (hadSelection) {
-            keyFile = hits_[static_cast<size_t>(selected)].file;
-            keyLine = hits_[static_cast<size_t>(selected)].line;
+            keyFile = res_->hits[static_cast<size_t>(selected)].file;
+            keyLine = res_->hits[static_cast<size_t>(selected)].line;
         }
-        std::vector<uint32_t> order(files_.size()), rank(files_.size());
+        std::vector<uint32_t> order(res_->files.size()), rank(res_->files.size());
         std::iota(order.begin(), order.end(), 0u);
         std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const int c = CompareStringOrdinal(files_[a].display.c_str(), -1, files_[b].display.c_str(), -1, TRUE);
+            const int c = CompareStringOrdinal(res_->files[a].display.c_str(), -1, res_->files[b].display.c_str(), -1, TRUE);
             return c != CSTR_EQUAL ? c == CSTR_LESS_THAN : a < b;
         });
         for (size_t i = 0; i < order.size(); ++i) rank[order[i]] = static_cast<uint32_t>(i);
-        std::stable_sort(hits_.begin(), hits_.end(), [&](const TextSearchHit& a, const TextSearchHit& b) {
+        std::stable_sort(res_->hits.begin(), res_->hits.end(), [&](const TextSearchHit& a, const TextSearchHit& b) {
             return a.file != b.file ? rank[a.file] < rank[b.file] : a.line < b.line;
         });
         ListView_SetItemState(list_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_SetItemCountEx(list_, static_cast<int>(hits_.size()), 0);
+        ListView_SetItemCountEx(list_, static_cast<int>(res_->hits.size()), 0);
         FitColumns();
         if (hadSelection) {
-            for (size_t i = 0; i < hits_.size(); ++i) {
-                if (hits_[i].file == keyFile && hits_[i].line == keyLine) {
+            for (size_t i = 0; i < res_->hits.size(); ++i) {
+                if (res_->hits[i].file == keyFile && res_->hits[i].line == keyLine) {
                     ListView_SetItemState(list_, static_cast<int>(i), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
                     ListView_EnsureVisible(list_, static_cast<int>(i), FALSE);
                     break;
@@ -578,24 +727,27 @@ private:
 
     int SelectedRow() const {
         const int row = ListView_GetNextItem(list_, -1, LVNI_SELECTED);
-        return row >= 0 && static_cast<size_t>(row) < hits_.size() ? row : -1;
+        return row >= 0 && static_cast<size_t>(row) < res_->hits.size() ? row : -1;
     }
 
     void OpenRow(int row) {
-        if (row < 0 || static_cast<size_t>(row) >= hits_.size()) return;
-        const TextSearchHit& h = hits_[static_cast<size_t>(row)];
+        if (row < 0 || static_cast<size_t>(row) >= res_->hits.size()) return;
+        const TextSearchHit& h = res_->hits[static_cast<size_t>(row)];
+        OpenHit(FileOf(h), h.line);
+    }
+
+    void OpenHit(const TextSearchFile& file, uint32_t line) {
         HMODULE module = AddModuleRef();
-        auto* args = new OpenArgs{FileOf(h), h.line, hwnd_, openState_, module};
-        if (!StartThread(&OpenThread, args, module)) {
+        auto* args = new OpenArgs{file, line, hwnd_, openState_, module};
+        if (!StartThread(&OpenThread, args, module, kThreadStack)) {
             delete args;
             SetStatus(L"Couldn't start the editor.", true);
             return;
         }
-        SetStatus(L"Opening " + FileOf(h).display + L"…");
+        SetStatus(L"Opening " + file.display + L"…");
     }
 
-    std::wstring RowPath(int row) const {
-        const TextSearchFile& f = FileOf(hits_[static_cast<size_t>(row)]);
+    static std::wstring PathOf(const TextSearchFile& f) {
         if (f.inner.empty()) return f.diskPath;
         std::wstring inner = FromBytes(f.inner);
         std::replace(inner.begin(), inner.end(), L'/', L'\\');
@@ -606,11 +758,74 @@ private:
         if (!SetClipboardText(hwnd_, text)) SetStatus(L"The clipboard couldn't be opened.", true);
     }
 
+    // The text is built on a worker (a big result set takes seconds and a lot of memory) and
+    // comes back as a ready clipboard block; this thread only hands it to the clipboard.
     void CopyResults() {
-        if (hits_.empty() || running_) return;
-        if (!SetClipboardText(hwnd_, ResultsText())) return;
+        if (res_->hits.empty() || running_ || copying_) return;
+        HMODULE module = AddModuleRef();
+        CopyArgs* args = nullptr;
+        try {
+            copyState_ = std::make_shared<CopyState>();
+            copyState_->generation = copyGeneration_;
+            args = new CopyArgs{res_, L"Search \"" + lastQuery_ + L"\" in " + lastScope_ + L"\r\n", copyState_, hwnd_, module};
+        } catch (...) {
+            if (module) FreeLibrary(module);
+            SetStatus(L"Not enough memory to copy the results.", true);
+            return;
+        }
+        if (!StartThread(&CopyThread, args, module)) {
+            delete args;
+            SetStatus(L"Couldn't start the copy.", true);
+            return;
+        }
+        copying_ = true;
+        SetWindowTextW(copy_, L"Copying…");
+        UpdateCopyButton();
+    }
+
+    void UpdateCopyButton() { EnableWindow(copy_, !running_ && !copying_ && !res_->hits.empty()); }
+
+    void OnCopied() {
+        std::shared_ptr<CopyState> state = copyState_;
+        if (!state || !copying_) return;
+        copying_ = false;
+        copyState_.reset();
+        SetWindowTextW(copy_, L"Copy results");
+        UpdateCopyButton();
+        if (state->generation != copyGeneration_) return;  // a new search replaced the rows meanwhile
+        HGLOBAL mem = nullptr;
+        bool cut = false, failed = false;
+        size_t lines = 0, total = 0;
+        {
+            std::lock_guard<std::mutex> g(state->lock);
+            mem = state->mem;
+            cut = state->cut;
+            failed = state->failed;
+            lines = state->lines;
+            total = state->total;
+        }
+        if (failed || !mem) {
+            SetStatus(L"Not enough memory to copy the results.", true);
+            return;
+        }
+        if (!OpenClipboard(hwnd_)) {
+            SetStatus(L"The clipboard couldn't be opened.", true);
+            return;
+        }
+        EmptyClipboard();
+        const bool ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        CloseClipboard();
+        if (!ok) {
+            SetStatus(L"The clipboard couldn't take the results.", true);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> g(state->lock);
+            state->mem = nullptr;  // the clipboard owns it now
+        }
         SetWindowTextW(copy_, L"Copied");
         SetTimer(hwnd_, kTimerCopied, 1500, nullptr);
+        if (cut) SetStatus(L"Copied the first " + Num(lines) + L" of " + Num(total) + L" lines: the clipboard text is limited to 64 MB.");
     }
 
     void SelectRow(int row) {
@@ -619,6 +834,7 @@ private:
     }
 
     void ShowRowMenu(int row, POINT screen) {
+        if (row < 0 || static_cast<size_t>(row) >= res_->hits.size()) return;
         SelectRow(row);
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
@@ -626,12 +842,15 @@ private:
         AppendMenuW(menu, MF_STRING, IDM_COPYPATH, L"Copy path");
         AppendMenuW(menu, MF_STRING, IDM_COPYLINE, L"Copy line");
         SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
+        // The menu runs its own message loop, so the timer can finish the search and sort the
+        // rows while it is open: act on the hit as it was when the menu opened, not on the row.
+        const TextSearchHit hit = res_->hits[static_cast<size_t>(row)];
+        const TextSearchFile file = FileOf(hit);
         const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, hwnd_, nullptr);
         DestroyMenu(menu);
-        if (row < 0 || static_cast<size_t>(row) >= hits_.size()) return;
-        if (cmd == IDM_OPEN) OpenRow(row);
-        else if (cmd == IDM_COPYPATH) CopyText(RowPath(row));
-        else if (cmd == IDM_COPYLINE) CopyText(hits_[static_cast<size_t>(row)].text);
+        if (cmd == IDM_OPEN) OpenHit(file, hit.line);
+        else if (cmd == IDM_COPYPATH) CopyText(PathOf(file));
+        else if (cmd == IDM_COPYLINE) CopyText(hit.text);
     }
 
     void OnContextMenu(HWND from, LPARAM lp) {
@@ -651,7 +870,7 @@ private:
             LVHITTESTINFO hit{};
             hit.pt = c;
             row = ListView_HitTest(list_, &hit);
-            if (row < 0 || static_cast<size_t>(row) >= hits_.size()) return;
+            if (row < 0 || static_cast<size_t>(row) >= res_->hits.size()) return;
         }
         ShowRowMenu(row, pt);
     }
@@ -660,8 +879,8 @@ private:
 
     void FillDispInfo(NMLVDISPINFOW* di) {
         LVITEMW& it = di->item;
-        if (!(it.mask & LVIF_TEXT) || it.iItem < 0 || static_cast<size_t>(it.iItem) >= hits_.size() || !it.pszText || it.cchTextMax <= 0) return;
-        const TextSearchHit& h = hits_[static_cast<size_t>(it.iItem)];
+        if (!(it.mask & LVIF_TEXT) || it.iItem < 0 || static_cast<size_t>(it.iItem) >= res_->hits.size() || !it.pszText || it.cchTextMax <= 0) return;
+        const TextSearchHit& h = res_->hits[static_cast<size_t>(it.iItem)];
         std::wstring text;
         if (it.iSubItem == 0) text = FileOf(h).display;
         else if (it.iSubItem == 1) text = std::to_wstring(h.line);
@@ -691,8 +910,8 @@ private:
         COLORREF back = theme_.inputBack, fore = theme_.text;
         if (selected) SelectionColors(back, fore);
         FillBox(dc, r, back);
-        if (row < 0 || static_cast<size_t>(row) >= hits_.size()) return;
-        const TextSearchHit& h = hits_[static_cast<size_t>(row)];
+        if (row < 0 || static_cast<size_t>(row) >= res_->hits.size()) return;
+        const TextSearchHit& h = res_->hits[static_cast<size_t>(row)];
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, fore);
         RECT t = r;
@@ -802,6 +1021,7 @@ private:
             case WM_CREATE: return OnCreate();
             case WM_APP_OPENED: OnOpened(); return 0;
             case WM_APP_FIT: FitColumns(); return 0;
+            case WM_APP_COPIED: OnCopied(); return 0;
             case WM_APP_SNAP: Snapshot(); return 0;
             case WM_ERASEBKGND: return 1;
             case WM_PAINT: {
@@ -866,7 +1086,7 @@ private:
                 KillTimer(hwnd_, kTimerTick);
                 KillTimer(hwnd_, kTimerCopied);
                 if (png_.empty() && list_) SaveSearchOptions(CurrentOptions());
-                search_.reset();  // cancels and waits
+                RetireSearch(search_);  // cancelled now, destroyed off this thread
                 PostQuitMessage(0);
                 return 0;
             case WM_NCDESTROY:
@@ -966,7 +1186,7 @@ private:
     void Snapshot() {
         RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
         SaveWindowPng(hwnd_, png_, nullptr, nullptr);
-        const std::wstring text = L"status\t" + status_ + L"\r\nrows\t" + std::to_wstring(hits_.size()) + L"\r\n" + ResultsText();
+        const std::wstring text = L"status\t" + status_ + L"\r\ncopy\t" + (IsWindowEnabled(copy_) ? L"enabled" : L"disabled") + L"\r\nrows\t" + std::to_wstring(res_->hits.size()) + L"\r\n" + ResultsText();
         const int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
         std::string utf8(static_cast<size_t>(n > 0 ? n : 0), '\0');
         if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), utf8.data(), n, nullptr, nullptr);
@@ -980,8 +1200,10 @@ private:
     }
 
     std::wstring scope_, query_, png_, status_, resultStatus_, lastQuery_, lastScope_;
-    bool statusBad_ = false, resultBad_ = false, running_ = false, contrast_ = false;
-    size_t maxHits_ = 0;
+    bool statusBad_ = false, resultBad_ = false, running_ = false, contrast_ = false, copying_ = false;
+    size_t maxHits_ = 0, maxHitBytes_ = 0;
+    uint64_t copyGeneration_ = 0;
+    std::shared_ptr<CopyState> copyState_;
     HWND hwnd_ = nullptr, lblFind_ = nullptr, lblIn_ = nullptr, find_ = nullptr, in_ = nullptr, mask_ = nullptr, searchBtn_ = nullptr, cancel_ = nullptr;
     HWND list_ = nullptr, statusLabel_ = nullptr, copy_ = nullptr, close_ = nullptr;
     HWND checks_[5] = {}, labels_[5] = {};
@@ -992,8 +1214,7 @@ private:
     HBRUSH windowBrush_ = nullptr, inputBrush_ = nullptr;
     Theme theme_ = CurrentTheme();
     std::unique_ptr<TextSearch> search_;
-    std::vector<TextSearchHit> hits_;
-    std::vector<TextSearchFile> files_;
+    std::shared_ptr<ResultSet> res_ = std::make_shared<ResultSet>();
     std::shared_ptr<OpenState> openState_ = std::make_shared<OpenState>();
 };
 

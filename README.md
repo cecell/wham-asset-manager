@@ -246,19 +246,31 @@ The options are remembered between windows, in
 The list shows the file (relative to the scope; inside an archive it starts with
 the archive's name), the line number, and the line, with each match highlighted.
 Under the list: how many lines matched, how much was searched and how long it
-took, plus anything that couldn't be read. A search stops after 200,000
-matching lines and says so.
+took, plus anything that couldn't be read or was left out: cloud-only files
+(which would be downloaded), folders that are junctions or links (not followed),
+and lines where a regex gave up as too complex. A search stops after 200,000
+matching lines, or when the lines it keeps take 64 MB, and says so. A search
+uses one worker fewer than the background-work limit (at least one), so the
+Explorer columns keep filling in while it runs.
 
 - Double-click a row, or select it and press Enter, to open that line. WHAM uses
-  Notepad++ at that line if it is installed, and the default editor for the file
-  otherwise.
+  Notepad++ at that line if it is installed, and Notepad otherwise (never the
+  program Windows associates with the file type: a hit can be in a `.py` or
+  `.html` file you added to the mask, and that would run or render it).
 - A hit inside an archive opens a read-only copy in
-  `%TEMP%\WHAM search\<archive name>\`, named after the archive. Copies older
-  than a day are deleted the next time the window opens.
+  `%TEMP%\WHAM search\<archive name> <hash>\`, named after the archive (the hash
+  is of the archive's full path, so two archives with the same name in different
+  folders get separate copies). A decompiled script opens as
+  `%TEMP%\WHAM search\decompiled <hash>\<name> (decompiled).psc`, with the hash
+  of the `.pex`'s path. Copies older than a day are deleted the next time the
+  window opens, and uninstalling removes the folder.
 - Right-click a row for **Open**, **Copy path** (a loose file's path; for an
   archive, the archive's path and the file's path inside it) and **Copy line**.
 - **Copy results** copies every row as `file:line:text`, with a first line that
-  names the search.
+  names the search. It is built in the background, and cut at 64 MB of text (the
+  status line says so).
+- If decompiling a script ever crashes the decompiler, the search stops
+  decompiling for the rest of that run and says so.
 
 **Command line**
 

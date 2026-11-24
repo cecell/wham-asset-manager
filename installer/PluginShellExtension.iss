@@ -369,15 +369,27 @@ begin
   CallDllInstall(Install, 'views');
 end;
 
+// The CLSID key or any of the four handler keys: if one was removed by hand or by a
+// cleaner, the rest still get removed.
 function SearchMenuRegistered: Boolean;
 begin
-  Result := RegKeyExists(HKCU, 'Software\Classes\Directory\shellex\ContextMenuHandlers\PluginShellExtensionSearch');
+  Result := RegKeyExists(HKCU, 'Software\Classes\CLSID\{6B9B6F9F-CD70-4390-BBA9-A6A3D71E9D87}')
+    or RegKeyExists(HKCU, 'Software\Classes\Directory\shellex\ContextMenuHandlers\PluginShellExtensionSearch')
+    or RegKeyExists(HKCU, 'Software\Classes\Directory\Background\shellex\ContextMenuHandlers\PluginShellExtensionSearch')
+    or RegKeyExists(HKCU, 'Software\Classes\Drive\shellex\ContextMenuHandlers\PluginShellExtensionSearch')
+    or RegKeyExists(HKCU, 'Software\Classes\SystemFileAssociations\.bsa\shellex\ContextMenuHandlers\PluginShellExtensionSearch');
 end;
 
 // Adds (or removes) it for this user: DllInstall with "search".
 procedure RunSearchRegistration(Install: Boolean);
 begin
   CallDllInstall(Install, 'search');
+end;
+
+// Uninstall: deletes the opened copies, %TEMP%\WHAM search (DllInstall "searchcopies", uninstalling).
+procedure RemoveSearchCopies;
+begin
+  CallDllInstall(False, 'searchcopies');
 end;
 
 function PapyrusMenuRegistered: Boolean;
@@ -460,6 +472,7 @@ begin
       RunFolderViewsRegistration(False);
     if SearchMenuRegistered then
       RunSearchRegistration(False);
+    RemoveSearchCopies;  // whether or not the menu was there: the folder may be left from earlier use
     if PapyrusMenuRegistered then
       RunPapyrusRegistration(False);
     if BsaBrowseRegistered then

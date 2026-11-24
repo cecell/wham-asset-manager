@@ -37,14 +37,17 @@ std::wstring SearchOptionsFilePath() {
     std::wstring folder;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) folder = std::wstring(base) + L"\\Plugin Shell Extension";
     CoTaskMemFree(base);
-    if (!folder.empty()) CreateDirectoryW(folder.c_str(), nullptr);
+    if (folder.empty()) return {};  // no known folder: no file (never the root of the current drive)
+    CreateDirectoryW(folder.c_str(), nullptr);
     return folder + L"\\search_options.json";
 }
 
 SearchWindowOptions LoadSearchOptions() {
     SearchWindowOptions o;
     try {
-        std::ifstream file(std::filesystem::path(SearchOptionsFilePath()), std::ios::binary);
+        const std::wstring where = SearchOptionsFilePath();
+        if (where.empty()) return o;
+        std::ifstream file(std::filesystem::path(where), std::ios::binary);
         if (!file) return o;
         const json root = json::parse(file, nullptr, false);
         if (root.is_discarded() || !root.is_object()) return o;
@@ -71,6 +74,7 @@ bool SaveSearchOptions(const SearchWindowOptions& o) {
                            {"extensions", Narrow(o.extensions)}, {"decompilePex", o.decompilePex}};
         const std::string text = root.dump(2);
         const std::wstring path = SearchOptionsFilePath();
+        if (path.empty()) return false;
         const std::wstring temporary = path + L".tmp";
         {
             std::ofstream file(std::filesystem::path(temporary), std::ios::binary | std::ios::trunc);

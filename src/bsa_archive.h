@@ -46,11 +46,14 @@ inline bool SafeName(const std::wstring& name) {
     if (name.empty() || name == L"." || name == L".." || name.back() == L'.' || name.back() == L' ') return false;
     for (wchar_t c : name)
         if (c < 32 || wcschr(L"<>:\"/\\|?*", c)) return false;
-    // Windows' device names, with or without an extension.
+    // Windows' device names, with or without an extension (and with spaces before it).
     std::wstring base = name.substr(0, name.find(L'.'));
+    while (!base.empty() && base.back() == L' ') base.pop_back();
     CharUpperBuffW(base.data(), static_cast<DWORD>(base.size()));
-    static const wchar_t* const reserved[] = {L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
-                                              L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"};
+    static const wchar_t* const reserved[] = {L"CON", L"PRN", L"AUX", L"NUL", L"CONIN$", L"CONOUT$",
+                                              L"COM0", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+                                              L"LPT0", L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9",
+                                              L"COM¹", L"COM²", L"COM³", L"LPT¹", L"LPT²", L"LPT³"};
     for (const wchar_t* r : reserved)
         if (base == r) return false;
     return true;

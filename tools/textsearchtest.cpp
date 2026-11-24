@@ -5,7 +5,7 @@
 // touched. The only things read from outside are a few small .pex files from
 // the game's Data\Scripts (read-only copies).
 //
-//   textsearchtest <path to wham-search.exe> [--keep] [--no-big]
+//   textsearchtest <path to wham-search.exe> [--keep] [--no-big] [--no-scale]
 #include <windows.h>
 
 #include <algorithm>
@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -26,7 +27,9 @@
 
 #include <bsa/reader.hpp>
 
+#include "papyrus_tools.h"
 #include "text_search.h"
+#include "work_budget.h"
 
 namespace fs = std::filesystem;
 using namespace pse;
@@ -398,11 +401,9 @@ struct Result {
     TextSearchStats stats;
 };
 
-Result Run(const fs::path& root, const TextSearchOptions& o) {
+Result Gather(TextSearch& ts, bool started) {
     Result r;
-    TextSearch ts;
-    r.started = ts.Start(root.wstring(), o);
-    ts.Wait();
+    r.started = started;
     ts.TakeHits(r.hits);
     r.files = ts.Files();
     r.stats = ts.Stats();
@@ -410,6 +411,13 @@ Result Run(const fs::path& root, const TextSearchOptions& o) {
     for (const TextSearchHit& h : r.hits) s.Add(Utf8(r.files[h.file].display), h.line, Utf8(h.text));
     r.lines = s.Lines();
     return r;
+}
+
+Result Run(const fs::path& root, const TextSearchOptions& o) {
+    TextSearch ts;
+    const bool started = ts.Start(root.wstring(), o);
+    ts.Wait();
+    return Gather(ts, started);
 }
 
 TextSearchOptions Opts(const std::string& q, bool matchCase = false, bool word = false, bool regex = false, bool other = false, int threads = 4) {
@@ -571,6 +579,19 @@ void TestRequiredLiteral() {
         {"((a|b)c)defg", "defg"},
         {"a\\.b\\.c", "a.b.c"},
         {"abc(?:def)ghi", "abc"},
+        // PCRE2 10.43+: spaces inside the braces
+        {"abc{ 2 }", "abc"},
+        {"abcd{ 0 }", "abc"},
+        {"abcd{ ,3}", "abc"},
+        {"abc{2, 3}", "abc"},
+        {"abcd{ 2 , 3 }e", "abcd"},
+        {"abcd{ x}", "abc"},
+        {"ab{x}cde", "ab{x}cde"},
+        {"x{ 0, 2 }abcd", "abcd"},
+        // \Q...\E inside a group or a class
+        {"(?:\\Q)\\Efoo)?bar", "bar"},
+        {"[\\Q]\\Eabc]xyz", "xyz"},
+        {"(\\Q(\\E)?abcd", "abcd"},
     };
     int n = 0;
     for (const Case& c : cases) {
@@ -854,7 +875,7 @@ void TestBig(const fs::path& base) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         TextSearch ts;
         TextSearchOptions o = Opts("\\d{9}x", false, false, true, false, 2);  // no literal: every line runs the regex
-        ts.Start(big.wstring(), o);
+        const bool started = ts.Start(big.wstring(), o);
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         const auto c0 = std::chrono::steady_clock::now();
         ts.Cancel();
@@ -862,7 +883,7 @@ void TestBig(const fs::path& base) {
         const double took = Seconds(c0);
         const TextSearchStats st = ts.Stats();
         Check(std::string("cancel on the huge file returns in under 500 ms, stats.cancelled") + (attempt ? " (again)" : ""), took < 0.5 && st.cancelled && st.done,
-              "took " + std::to_string(took) + " s");
+              "started " + std::to_string(started) + " took " + std::to_string(took) + " s done " + std::to_string(st.done) + " files " + std::to_string(st.filesSearched) + " errors " + std::to_string(st.errors) + " " + Utf8(st.firstError));
     }
     {
         TextSearch ts;
@@ -969,6 +990,8 @@ void TestPex(const fs::path& base) {
 
 // ---------------------------------------------------------------- reading and copying
 
+void TestCopies(const Fixture& f, const fs::path& tempDir, const Result& r);
+
 void TestRead(const Fixture& f, const fs::path& tempDir) {
     const fs::path& m = f.main;
     const Result r = Run(m, Opts("zebra", false));
@@ -1004,7 +1027,9 @@ void TestRead(const Fixture& f, const fs::path& tempDir) {
         const TextSearchFile tf = fileOf("Root.bsa\\scripts\\source\\r1.psc");
         std::wstring path, error;
         const bool ok = WriteSearchCopy(tf, path, error);
-        const fs::path want = tempDir / L"WHAM search" / L"Root.bsa" / L"scripts" / L"source" / L"r1 (Root.bsa).psc";
+        const std::wstring rootHash = SearchCopyHash(tf.diskPath);
+        Check("SearchCopyHash: 8 lower-case hex digits, the same for another case of the path", rootHash.size() == 8 && rootHash.find_first_not_of(L"0123456789abcdef") == std::wstring::npos && rootHash == SearchCopyHash(Wide(LowerAscii(Utf8(tf.diskPath)))), Utf8(rootHash));
+        const fs::path want = tempDir / L"WHAM search" / (L"Root.bsa " + rootHash) / L"scripts" / L"source" / L"r1 (Root.bsa).psc";
         Check("WriteSearchCopy: expected path", ok && fs::path(path) == want, Utf8(path) + " " + Utf8(error));
         const DWORD attrs = GetFileAttributesW(path.c_str());
         Check("WriteSearchCopy: read-only attribute", attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY));
@@ -1036,6 +1061,10 @@ void TestRead(const Fixture& f, const fs::path& tempDir) {
         Check("WriteSearchCopy: refuses a device name", !WriteSearchCopy(bad, bpath, error));
         bad.inner = "\\scripts\\x.psc";
         Check("WriteSearchCopy: refuses an empty component", !WriteSearchCopy(bad, bpath, error));
+        for (const char* name : {"scripts\\com0.psc", "scripts\\LPT0.txt", "scripts\\conin$.psc", "scripts\\CONOUT$", "scripts\\com\xC2\xB9.psc", "scripts\\LPT\xC2\xB3.psc", "scripts\\con .psc"}) {
+            bad.inner = name;
+            Check(std::string("WriteSearchCopy: refuses the device name ") + name, !WriteSearchCopy(bad, bpath, error));
+        }
         // CleanUpSearchCopies: the old copy goes, the new one stays.
         SetFileAttributesW(cpath.c_str(), FILE_ATTRIBUTE_NORMAL);
         HANDLE h = CreateFileW(cpath.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1054,10 +1083,72 @@ void TestRead(const Fixture& f, const fs::path& tempDir) {
         CleanUpSearchCopies();
         std::error_code ec;
         Check("CleanUpSearchCopies: the 30-hour-old copy is deleted (read-only cleared)", !fs::exists(cpath, ec));
-        Check("CleanUpSearchCopies: its empty folders are removed", !fs::exists(fs::path(cpath).parent_path(), ec) && !fs::exists(tempDir / L"WHAM search" / L"Comp105.bsa", ec));
+        Check("CleanUpSearchCopies: its empty folders are removed", !fs::exists(fs::path(cpath).parent_path(), ec) && !fs::exists(tempDir / L"WHAM search" / (L"Comp105.bsa " + SearchCopyHash(cf.diskPath)), ec));
         Check("CleanUpSearchCopies: the new copy stays", fs::exists(path, ec));
         Check("CleanUpSearchCopies: nothing outside WHAM search is touched", fs::exists(tempDir / L"outside.txt", ec));
     }
+    TestCopies(f, tempDir, r);
+}
+
+void TestCopies(const Fixture& f, const fs::path& tempDir, const Result& r) {
+    (void)f;
+    (void)r;
+    // Two archives with the same name in different folders do not share a copy.
+    const fs::path dup = tempDir.parent_path() / L"dup";
+    const std::string a = BuildBsa(105, false, {{"scripts\\source\\dup.psc", "zebra from A\n"}});
+    const std::string b = BuildBsa(105, true, {{"scripts\\source\\dup.psc", "zebra from B\n"}});
+    WriteFileBytes(dup / L"A" / L"Dup.bsa", a);
+    WriteFileBytes(dup / L"B" / L"Dup.bsa", b);
+    const Result dr = Run(dup, Opts("zebra", false));
+    std::wstring pa, pb, error;
+    TextSearchFile fa, fb;
+    for (const TextSearchFile& tf : dr.files) {
+        if (tf.display.rfind(L"A\\", 0) == 0) fa = tf;
+        else if (tf.display.rfind(L"B\\", 0) == 0) fb = tf;
+    }
+    const bool okA = WriteSearchCopy(fa, pa, error), okB = WriteSearchCopy(fb, pb, error);
+    Check("same-named archives in two folders: two different copies, each with its own text", okA && okB && pa != pb && ReadFileBytes(pa) == "zebra from A\n" && ReadFileBytes(pb) == "zebra from B\n",
+          Utf8(pa) + " | " + Utf8(pb) + " " + Utf8(error));
+    Check("... in folders named <archive> <hash>", fs::path(pa).parent_path().parent_path().parent_path().filename().wstring() == L"Dup.bsa " + SearchCopyHash(fa.diskPath) &&
+          fs::path(pb).parent_path().parent_path().parent_path().filename().wstring() == L"Dup.bsa " + SearchCopyHash(fb.diskPath));
+
+    // Several writers at once (two windows, a double double-click): all succeed, the copy is whole and read-only.
+    for (int round = 0; round < 5; ++round) {
+        SetFileAttributesW(pa.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(pa.c_str());
+        std::atomic<int> good{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i)
+            threads.emplace_back([&] {
+                std::wstring p, e;
+                if (WriteSearchCopy(fa, p, e) && p == pa) ++good;
+            });
+        for (std::thread& t : threads) t.join();
+        const DWORD attrs = GetFileAttributesW(pa.c_str());
+        Check("8 simultaneous WriteSearchCopy calls (round " + std::to_string(round + 1) + "): all succeed, whole file, read-only",
+              good == 8 && ReadFileBytes(pa) == "zebra from A\n" && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY), std::to_string(good.load()));
+    }
+    {
+        // No temp files are left behind.
+        int tmp = 0;
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(tempDir / L"WHAM search", ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+            if (it->path().extension() == L".tmp") ++tmp;
+        Check("no .tmp files are left in WHAM search", tmp == 0, std::to_string(tmp));
+    }
+
+    // DeleteAllSearchCopies: the whole folder goes, read-only files too, links are never followed.
+    const fs::path outside = tempDir.parent_path() / L"outside_target";
+    WriteFileBytes(outside / L"keep.txt", "keep me");
+    const fs::path top = tempDir / L"WHAM search";
+    const Proc mk = RunProcess(L"C:\\Windows\\System32\\cmd.exe", {L"/c", L"mklink", L"/J", (top / L"link").wstring(), outside.wstring()});
+    Check("junction inside WHAM search created for the test", mk.code == 0, mk.out + mk.err);
+    DeleteAllSearchCopies();
+    std::error_code ec;
+    Check("DeleteAllSearchCopies: the folder is gone (read-only copies too)", !fs::exists(top, ec));
+    Check("DeleteAllSearchCopies: nothing outside it is touched, a junction's target is not entered", fs::exists(outside / L"keep.txt", ec) && fs::exists(tempDir / L"outside.txt", ec));
+    DeleteAllSearchCopies();  // already gone: no harm
+    Check("DeleteAllSearchCopies: a second call does nothing", !fs::exists(top, ec));
 }
 
 // ---------------------------------------------------------------- odd inputs
@@ -1093,7 +1184,19 @@ void TestOdd(const fs::path& base) {
     const Result jr = Run(junc, Opts("zebra", false));
     const std::vector<std::string> want = {"h1.psc:1:zebra hardlink", "h2.psc:1:zebra hardlink", "Real\\a.psc:1:zebra via real"};
     Check("junction not followed, hardlinks are normal files", jr.lines == want, Join(jr.lines));
+    Check("the junction is counted as a skipped linked folder", jr.stats.skippedLinked == 1, std::to_string(jr.stats.skippedLinked));
     RemoveDirectoryW((junc / L"Link").c_str());
+
+    // Cloud-only (offline) files are not read, and are counted.
+    const fs::path cloud = base / L"cloud";
+    WriteFileBytes(cloud / L"Scripts" / L"here.psc", "zebra here\n");
+    WriteFileBytes(cloud / L"Scripts" / L"away.psc", "zebra away\n");
+    WriteFileBytes(cloud / L"Scripts" / L"away.txt", "zebra away txt\n");
+    SetFileAttributesW((cloud / L"Scripts" / L"away.psc").c_str(), FILE_ATTRIBUTE_OFFLINE);
+    SetFileAttributesW((cloud / L"Scripts" / L"away.txt").c_str(), FILE_ATTRIBUTE_OFFLINE);
+    const Result cr = Run(cloud, Opts("zebra", false, false, false, true));
+    Check("cloud-only files are skipped and counted, never read", cr.lines.size() == 1 && cr.lines[0].find("here.psc") != std::string::npos && cr.stats.skippedCloud == 2 && cr.stats.errors == 0,
+          Join(cr.lines) + " skipped " + std::to_string(cr.stats.skippedCloud));
 
     // A file being written to by another process, and an exclusive lock.
     const fs::path lockDir = base / L"locks";
@@ -1106,6 +1209,206 @@ void TestOdd(const fs::path& base) {
     CloseHandle(sh);
     Check("a file open for writing elsewhere is read; an exclusively locked one is an error", lk.lines.size() == 1 && lk.lines[0].find("shared.psc") != std::string::npos && lk.stats.errors == 1,
           Join(lk.lines) + " errors " + std::to_string(lk.stats.errors));
+}
+
+// ---------------------------------------------------------------- engine limits
+
+// Takes WorkSlots in this process and holds them (the budget is shared by every process of the session).
+struct Holder {
+    std::vector<std::unique_ptr<WorkSlot>> slots;
+    bool Take(int n, int timeoutMs) {
+        std::atomic<bool> giveUp{false}, finished{false};
+        std::thread timer([&] {
+            for (int i = 0; i < timeoutMs / 10 && !finished; ++i) Sleep(10);
+            giveUp = true;
+        });
+        for (int i = 0; i < n; ++i) {
+            auto slot = std::make_unique<WorkSlot>(WorkKind::Interactive, &giveUp);
+            if (!slot->Held()) break;
+            slots.push_back(std::move(slot));
+        }
+        finished = true;
+        timer.join();
+        return static_cast<int>(slots.size()) == n;
+    }
+    void Release() { slots.clear(); }
+};
+
+bool WaitDone(TextSearch& ts, double seconds) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (Seconds(t0) < seconds) {
+        if (ts.Stats().done) return true;
+        Sleep(10);
+    }
+    return ts.Stats().done;
+}
+
+void TestBudget(const Fixture& f) {
+    const int limit = WorkerLimit();
+    std::printf("      (work limit %d)\n", limit);
+    const Result ref = Run(f.main, Opts("zebra", false));
+    {
+        const Result r = Run(f.main, Opts("zebra", false, false, false, false, 0));
+        Check("budget mode starts max(1, WorkerLimit() - 1) workers and finds the same lines", r.stats.workers == std::max(1, limit - 1) && r.lines == ref.lines,
+              "workers " + std::to_string(r.stats.workers) + " limit " + std::to_string(limit));
+        const Result t3 = Run(f.main, Opts("zebra", false, false, false, false, 3));
+        Check("threads=3 starts exactly 3 workers", t3.stats.workers == 3);
+    }
+    if (limit >= 3) {
+        // Two slots held elsewhere: limit-2 free for limit-1 workers, so one worker waits for a slot for good.
+        Holder h;
+        if (h.Take(2, 4000)) {
+            TextSearch ts;
+            const bool started = ts.Start(f.main.wstring(), Opts("zebra", false, false, false, false, 0));
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool done = WaitDone(ts, 10);
+            const double took = Seconds(t0);
+            Check("a worker still waiting for a slot doesn't hold the finished search back (slots stay held)", done && took < 5, "done " + std::to_string(done) + " took " + std::to_string(took) + " s");
+            h.Release();
+            ts.Wait();
+            const Result r = Gather(ts, started);
+            Check("... and it found every line", r.lines == ref.lines);
+        } else {
+            std::printf("      (skipped the partial-slots test: other processes hold slots)\n");
+        }
+    } else {
+        std::printf("      (skipped the partial-slots test: it needs a work limit of 3 or more)\n");
+    }
+    {
+        Holder h;
+        if (h.Take(limit, 4000)) {
+            TextSearch ts;
+            const bool started = ts.Start(f.main.wstring(), Opts("zebra", false, false, false, false, 0));
+            Sleep(300);
+            const bool waiting = !ts.Stats().done && ts.Stats().filesSearched == 0;
+            h.Release();
+            const bool done = WaitDone(ts, 10);
+            ts.Wait();
+            const Result r = Gather(ts, started);
+            Check("every slot held: the search waits, then completes once they are released", waiting && done && r.lines == ref.lines,
+                  "waiting " + std::to_string(waiting) + " done " + std::to_string(done) + " lines " + std::to_string(r.lines.size()));
+        } else {
+            std::printf("      (skipped the all-slots test: other processes hold slots)\n");
+        }
+    }
+    {
+        Holder h;
+        if (h.Take(limit, 4000)) {
+            TextSearch ts;
+            ts.Start(f.main.wstring(), Opts("zebra", false, false, false, false, 0));
+            Sleep(100);
+            const auto c0 = std::chrono::steady_clock::now();
+            ts.Cancel();
+            ts.Wait();
+            const TextSearchStats st = ts.Stats();
+            Check("cancelling a search that waits for slots returns at once", Seconds(c0) < 1.0 && st.done && st.cancelled, std::to_string(Seconds(c0)));
+        }
+    }
+}
+
+void TestHitBytes(const fs::path& base) {
+    const fs::path root = base / L"bytes";
+    std::string body;
+    for (int i = 0; i < 5000; ++i) body += "zebra line " + std::to_string(i) + " with some filler text to make the line a bit longer than short\n";
+    WriteFileBytes(root / L"Scripts" / L"many.psc", body);
+    TextSearchOptions o = Opts("zebra", false);
+    Check("maxHitBytes defaults to 64 MB, maxHits to 200,000", o.maxHitBytes == (size_t{64} << 20) && o.maxHits == 200000);
+    const Result all = Run(root, o);
+    Check("no byte limit hit: all 5000 lines, not truncated", all.stats.hits == 5000 && !all.stats.truncated && !all.stats.truncatedByBytes);
+    o.maxHitBytes = 100000;
+    const Result cut = Run(root, o);
+    size_t bytes = 0;
+    for (const TextSearchHit& h : cut.hits) bytes += sizeof(TextSearchHit) + h.text.size() * sizeof(wchar_t) + h.ranges.size() * 8;
+    Check("maxHitBytes 100,000: stops early, truncated and truncatedByBytes, within the limit", cut.stats.truncated && cut.stats.truncatedByBytes && cut.hits.size() > 100 && cut.hits.size() < 2000 && bytes <= 100000 && cut.stats.done,
+          "hits " + std::to_string(cut.hits.size()) + " bytes " + std::to_string(bytes));
+    o.maxHitBytes = size_t{64} << 20;
+    o.maxHits = 10;
+    const Result few = Run(root, o);
+    Check("maxHits 10: truncated by count, not by bytes", few.stats.truncated && !few.stats.truncatedByBytes && few.stats.hits == 10);
+}
+
+void TestRegexExtras(const fs::path& base) {
+    const fs::path root = base / L"rx";
+    WriteFileBytes(root / L"Scripts" / L"q.psc", "abcc here\nabc not\nabccc no\n");
+    const Result r = Run(root, Opts("abc{ 2 }\\b", true, false, true));
+    Check("regex abc{ 2 }\\b (spaces inside braces) finds the line with abcc", r.lines.size() == 1 && r.lines[0].find("q.psc:1:abcc here") != std::string::npos && r.stats.regexLimitLines == 0, Join(r.lines));
+    const Result r2 = Run(root, Opts("abc{ 2, 3 }", true, false, true));
+    Check("regex abc{ 2, 3 } finds abcc and abccc", r2.lines.size() == 2, Join(r2.lines));
+    WriteFileBytes(root / L"Scripts" / L"slow.psc", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\nfine\n");
+    const Result lim = Run(root, Opts("^(a+)+$", true, false, true));
+    Check("a catastrophic regex line is counted as too complex, with no hit", lim.stats.regexLimitLines == 1 && lim.stats.hits == 0 && lim.stats.done, "limit lines " + std::to_string(lim.stats.regexLimitLines) + " hits " + std::to_string(lim.stats.hits));
+    if (!g_cli.empty() && fs::exists(g_cli)) {
+        const Proc p = RunProcess(g_cli.wstring(), {L"-e", L"-j", L"1", L"^(a+)+$", root.wstring()});
+        Check("CLI summary mentions lines too complex for the regex", p.err.find("1 lines too complex for the regex") != std::string::npos, p.err);
+    }
+}
+
+// The decompiler "crashes" on the second script it is given.
+std::atomic<int> g_decompileCalls{0};
+void CrashOnSecond(const uint8_t*, size_t) {
+    if (++g_decompileCalls == 2) *static_cast<volatile int*>(nullptr) = 1;  // an access violation
+}
+
+void TestPexCrash(const fs::path& base) {
+    const fs::path data = L"D:\\SteamLibrary\\steamapps\\common\\Skyrim Special Edition\\Data\\Scripts";
+    const std::string bytes = ReadFileBytes(data / L"Debris.pex");
+    if (bytes.empty()) {
+        Check("--pex crash: Debris.pex readable from the game's Data", false, "missing");
+        return;
+    }
+    const fs::path root = base / L"pexcrash";
+    for (int i = 0; i < 6; ++i) WriteFileBytes(root / L"Scripts" / (L"c" + std::to_wstring(i) + L".pex"), bytes);
+    WriteFileBytes(root / L"Pex.bsa", BuildBsa(105, true, {{"scripts\\b1.pex", bytes}, {"scripts\\b2.pex", bytes}, {"scripts\\b3.pex", bytes}}));
+    TextSearchOptions o = Opts("scriptname", false);
+    o.decompilePex = true;
+    for (int t : {1, 4}) {
+        g_decompileCalls = 0;
+        SetDecompileTestHook(&CrashOnSecond);
+        o.threads = t;
+        const Result r = Run(root, o);
+        SetDecompileTestHook(nullptr);
+        const TextSearchStats& s = r.stats;
+        Check("decompiler crash, threads=" + std::to_string(t) + ": the search ends normally and the process lives", r.started && s.done && !s.cancelled);
+        Check("decompiler crash, threads=" + std::to_string(t) + ": one crash, every script either decompiled, the crash or skipped",
+              s.pexCrashed == 1 && s.pexDecompiled + s.pexCrashed + s.pexSkipped == 9 && s.pexDecompiled >= 1 && s.pexSkipped >= 1,
+              "decompiled " + std::to_string(s.pexDecompiled) + " crashed " + std::to_string(s.pexCrashed) + " skipped " + std::to_string(s.pexSkipped));
+        if (t == 1) Check("decompiler crash, threads=1: exactly one decompiled, the rest skipped", s.pexDecompiled == 1 && s.pexSkipped == 7);
+        Check("decompiler crash, threads=" + std::to_string(t) + ": the message names the file; errors count it",
+              s.decompileStopped.rfind(L"Decompiling stopped after ", 0) == 0 && s.decompileStopped.find(L" crashed the decompiler") != std::wstring::npos && s.firstError == s.decompileStopped && s.errors == 1,
+              Utf8(s.decompileStopped));
+        Check("decompiler crash, threads=" + std::to_string(t) + ": hits from before the crash are kept", r.hits.size() >= 1);
+    }
+    // Without the hook the same tree decompiles all nine.
+    o.threads = 4;
+    const Result ok = Run(root, o);
+    Check("no hook: all nine decompile, nothing skipped or crashed", ok.stats.pexDecompiled == 9 && ok.stats.pexCrashed == 0 && ok.stats.pexSkipped == 0 && ok.stats.decompileStopped.empty(),
+          std::to_string(ok.stats.pexDecompiled));
+}
+
+void TestPexCopies(const fs::path& base) {
+    const fs::path data = L"D:\\SteamLibrary\\steamapps\\common\\Skyrim Special Edition\\Data\\Scripts";
+    const std::string bytes = ReadFileBytes(data / L"sggx.pex");
+    if (bytes.empty()) {
+        Check("--pex copies: sggx.pex readable from the game's Data", false, "missing");
+        return;
+    }
+    const fs::path root = base / L"pexcopies";
+    WriteFileBytes(root / L"ModA" / L"Scripts" / L"sggx.pex", bytes);
+    WriteFileBytes(root / L"ModB" / L"Scripts" / L"sggx.pex", bytes);
+    TextSearchOptions o = Opts("scriptname", false);
+    o.decompilePex = true;
+    const Result r = Run(root, o);
+    std::vector<std::wstring> paths;
+    bool ok = r.files.size() == 2;
+    for (const TextSearchFile& tf : r.files) {
+        std::wstring path, error;
+        ok = ok && tf.decompiled && WriteSearchCopy(tf, path, error);
+        paths.push_back(path);
+        const fs::path want = fs::path(L"decompiled " + SearchCopyHash(tf.diskPath)) / L"sggx (decompiled).psc";
+        ok = ok && fs::path(path).parent_path().filename() == want.parent_path() && fs::path(path).filename() == want.filename();
+    }
+    Check("two loose sggx.pex in different folders: different decompiled copies, named decompiled <hash>\\sggx (decompiled).psc", ok && paths.size() == 2 && paths[0] != paths[1] && fs::exists(paths[0]) && fs::exists(paths[1]),
+          paths.empty() ? "" : Utf8(paths[0]));
 }
 
 void TestParse() {
@@ -1191,9 +1494,9 @@ void TestCli(const Fixture& f, const fs::path& tempDir) {
     }
     {
         const Proc p = RunProcess(exe, {L"--copy", L"-l", L"zebra", (f.main / L"Root.bsa").wstring()});
-        const std::string want = "copy:Root.bsa\\scripts\\source\\r1.psc\t" + Utf8((tempDir / L"WHAM search" / L"Root.bsa" / L"scripts" / L"source" / L"r1 (Root.bsa).psc").wstring()) + "\n";
-        Check("CLI: --copy prints copy:<display><TAB><path> and the file exists", p.code == 0 && p.out.find(want) != std::string::npos &&
-              fs::exists(tempDir / L"WHAM search" / L"Root.bsa" / L"scripts" / L"source" / L"r1 (Root.bsa).psc"), p.out + p.err);
+        const fs::path copy = tempDir / L"WHAM search" / (L"Root.bsa " + SearchCopyHash((f.main / L"Root.bsa").wstring())) / L"scripts" / L"source" / L"r1 (Root.bsa).psc";
+        const std::string want = "copy:Root.bsa\\scripts\\source\\r1.psc\t" + Utf8(copy.wstring()) + "\n";
+        Check("CLI: --copy prints copy:<display><TAB><path> and the file exists", p.code == 0 && p.out.find(want) != std::string::npos && fs::exists(copy), p.out + p.err);
     }
 }
 
@@ -1208,11 +1511,12 @@ void TestCliBig(const fs::path& base) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    bool keep = false, big = true;
+    bool keep = false, big = true, scale = true;
     for (int i = 1; i < argc; ++i) {
         const std::wstring a = argv[i];
         if (a == L"--keep") keep = true;
         else if (a == L"--no-big") big = false;
+        else if (a == L"--no-scale") scale = false;
         else g_cli = fs::absolute(a);
     }
     wchar_t tempBuf[MAX_PATH * 2];
@@ -1234,8 +1538,13 @@ int wmain(int argc, wchar_t** argv) {
     TestRead(f, tempDir);
     TestOdd(base);
     TestPex(base);
+    TestPexCopies(base);
+    TestPexCrash(base);
+    TestBudget(f);
+    TestHitBytes(base);
+    TestRegexExtras(base);
     TestCli(f, tempDir);
-    TestScale(base);
+    if (scale) TestScale(base);
     if (big) {
         TestBig(base);
         TestCliBig(base);

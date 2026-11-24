@@ -16,6 +16,7 @@
 #include "tool_menus.h"
 #include "search_menu.h"
 #include "search_window.h"
+#include "text_search.h"
 #include "folder_views_menu.h"
 #include "file_property_handler.h"
 #include "tool_windows.h"
@@ -166,6 +167,12 @@ STDAPI DllInstall(BOOL install, PCWSTR cmdLineIn) {
         } else {
             pse::RemoveSearchMenu(HKEY_CURRENT_USER, L"Software\\Classes\\");
         }
+        return S_OK;
+    }
+    // regsvr32 /u /n /i:searchcopies PluginShellExtension.dll deletes the folder of
+    // opened copies, %TEMP%\WHAM search (setup's uninstaller runs it). Installing does nothing.
+    if (cmdLine && _wcsicmp(cmdLine, L"searchcopies") == 0) {
+        if (!install) pse::DeleteAllSearchCopies();
         return S_OK;
     }
     // regsvr32 /n /i:papyrus PluginShellExtension.dll adds Decompile to .pex and

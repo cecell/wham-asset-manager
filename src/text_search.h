@@ -10,6 +10,12 @@
 // Threads: workers pull from one shared queue of folders, files and archives,
 // so listing and searching overlap. Each worker holds a WorkSlot (unless
 // threads > 0, for the command line tool) and calls Pace() between items.
+// In that budget mode a search starts max(1, WorkerLimit() - 1) workers, so one
+// slot stays free for Background work (columns, BSA folders) in every process.
+// A worker that can't get a slot gives up as soon as the search is finished
+// (done, cancelled or at a limit), so `done` doesn't wait for other jobs.
+// Destroying a TextSearch waits for its workers: from a UI thread, Cancel() it
+// and destroy it on another thread.
 #pragma once
 
 #include <atomic>
@@ -29,10 +35,11 @@ struct TextSearchOptions {
     bool otherText = false;  // also search extraExtensions
     std::vector<std::wstring> extraExtensions;  // ".txt", ".ini", ... (lower case, with the dot)
     bool decompilePex = false;  // also .pex whose script has no .psc in scope
-    // 0: WorkerLimit() workers, each holding a WorkSlot (Interactive) and pacing.
+    // 0: max(1, WorkerLimit() - 1) workers, each holding a WorkSlot (Interactive) and pacing.
     // >0: exactly this many workers (clamped to 1..16), no WorkSlot, no pacing.
     int threads = 0;
     size_t maxHits = 200000;  // stop adding lines after this many (stats.truncated)
+    size_t maxHitBytes = size_t{64} << 20;  // ... or after the lines' text and ranges take this much memory (truncated + truncatedByBytes)
 };
 
 // The default extra extensions, as shown in the window's mask box.
@@ -68,8 +75,16 @@ struct TextSearchStats {
     uint64_t pexDecompiled = 0;
     uint64_t skippedBinary = 0;     // files in the set that looked binary (NUL bytes) and were skipped
     uint64_t errors = 0;            // files or archives that couldn't be read
+    uint64_t pexCrashed = 0;        // decompiler crashes (the first one stops decompiling for the rest of the search)
+    uint64_t pexSkipped = 0;        // .pex not decompiled because of that
+    uint64_t regexLimitLines = 0;   // lines where the regex hit its match, depth or heap limit (counted as no match)
+    uint64_t skippedCloud = 0;      // files that would be searched but are cloud-only / offline (reading would download them)
+    uint64_t skippedLinked = 0;     // folders that are junctions or symbolic links (not followed)
+    int workers = 0;                // threads started
     double seconds = 0;             // since Start
     bool done = false, cancelled = false, truncated = false;
+    bool truncatedByBytes = false;  // truncated because of maxHitBytes
+    std::wstring decompileStopped;  // "Decompiling stopped after <file> crashed the decompiler", or empty
     std::wstring firstError;        // e.g. "Bad regex: missing ) at 7", or the first unreadable file
 };
 
@@ -105,16 +120,26 @@ private:
 bool ReadSearchFileBytes(const TextSearchFile& file, std::string& bytes, std::wstring& error);
 
 // Where the opened copy of an archive entry or a decompiled script goes:
-// %TEMP%\WHAM search\<archive name>\<inner path with \>, with the archive name
-// added to the file name, e.g. ...\SimplyKnock.bsa\scripts\source\foo (SimplyKnock.bsa).psc.
-// Writes it (read-only attribute) when missing or different and returns its path.
+// %TEMP%\WHAM search\<archive name> <hash>\<inner path with \>, with the archive
+// name added to the file name, e.g.
+// ...\SimplyKnock.bsa 1a2b3c4d\scripts\source\foo (SimplyKnock.bsa).psc; a loose
+// decompiled script goes to ...\decompiled <hash>\foo (decompiled).psc. <hash> is
+// SearchCopyHash() of the archive's (or the .pex's) full path, so the same name in
+// two folders never shares a copy. Written atomically (temp file + rename), then
+// made read-only; kept when it already holds the same bytes. Returns its path.
 // Copies older than a day are deleted by CleanUpSearchCopies().
 bool WriteSearchCopy(const TextSearchFile& file, std::wstring& path, std::wstring& error);
 void CleanUpSearchCopies();
+// 8 hex digits: FNV-1a 32 over the UTF-16 bytes of the lower-cased path.
+std::wstring SearchCopyHash(const std::wstring& fullPath);
+// Deletes the whole %TEMP%\WHAM search folder (read-only cleared, links never followed,
+// nothing outside it); setup's uninstaller calls it through DllInstall.
+void DeleteAllSearchCopies();
 
 // Notepad++ if installed (App Paths, HKLM\SOFTWARE\Notepad++, Program Files), else empty.
 std::wstring FindNotepadPlusPlus();
-// Opens `path` at `line`: Notepad++ -n<line>, else the default "open" verb, else notepad.exe.
+// Opens `path` at `line`: Notepad++ -n<line>, else the system notepad.exe. Never the
+// shell's "open" verb: a hit can be any file the mask allows, and "open" would run some.
 bool OpenInEditor(const std::wstring& path, uint32_t line, std::wstring& error);
 
 // The longest run of characters (3 or more) that every match of a regex must
