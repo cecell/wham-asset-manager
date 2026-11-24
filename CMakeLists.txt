@@ -45,6 +45,20 @@ FetchContent_Declare(nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
     URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
 FetchContent_MakeAvailable(nlohmann_json)
+# PCRE2 (BSD, github.com/PCRE2Project/pcre2): the regex mode of Search text.
+# Only the static 8-bit library, no JIT (it needs executable memory, which
+# Explorer shouldn't ask for).
+set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(PCRE2_SUPPORT_JIT OFF CACHE BOOL "" FORCE)
+set(PCRE2_SHOW_REPORT OFF CACHE BOOL "" FORCE)
+set(PCRE2_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(pcre2
+    URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.gz
+    URL_HASH SHA256=86b9cb0aa3bcb7994faa88018292bc704cdbb708e785f7c74352ff6ea7d3175b)
+FetchContent_MakeAvailable(pcre2)
 
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00
     PSE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR} PSE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
@@ -103,10 +117,11 @@ add_library(psetools STATIC
     src/asset_facts.cpp
     src/disk_cache.cpp
     src/winner.cpp
-    src/dependents.cpp)
+    src/dependents.cpp
+    src/text_search.cpp)
 target_include_directories(psetools PUBLIC src)
 target_link_libraries(psetools PUBLIC psecore psepattern bsa::reader asset::metadata skqe::papyrus bcrypt advapi32 shell32 ole32 propsys shlwapi)
-target_link_libraries(psetools PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(psetools PRIVATE nlohmann_json::nlohmann_json pcre2-8-static)
 
 add_executable(itmcheck tools/itmcheck.cpp)
 target_link_libraries(itmcheck PRIVATE psepattern)
@@ -149,6 +164,14 @@ if(PSE_ASAN)
     target_link_options(watchsettest PRIVATE /INCREMENTAL:NO /DEBUG)
 endif()
 add_test(NAME watchset COMMAND watchsettest)
+
+# Search text: the command line tool and its tests.
+add_executable(wham-search tools/wham_search.cpp)
+target_link_libraries(wham-search PRIVATE psetools nlohmann_json::nlohmann_json)
+add_executable(textsearchtest tools/textsearchtest.cpp)
+target_link_libraries(textsearchtest PRIVATE psetools)
+add_dependencies(textsearchtest wham-search)
+add_test(NAME textsearch COMMAND textsearchtest $<TARGET_FILE:wham-search>)
 
 set_target_properties(PluginShellExtension PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 target_link_options(PluginShellExtension PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF;/INCREMENTAL:NO;/PDBALTPATH:%_PDB%>")

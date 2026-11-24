@@ -85,11 +85,14 @@ int WorkerLimit() { return std::clamp(WorkerThreadCount(), 1, kSlots); }
 
 int ActiveWorkers() { return CountTaken(Block()); }
 
-unsigned PaceDelayMs(int cpuPercent, int active, int limit) {
+unsigned PaceDelayMs(int cpuPercent, int active, int limit, WorkKind kind) {
     const double cpu = std::clamp(cpuPercent, 0, 100);
     const double pressure = cpu <= 50 ? 0 : (cpu - 50) / 50;
     const double fromCpu = pressure * pressure * 200;
-    const double crowd = limit > 0 && active > 1 ? static_cast<double>(active - 1) * active / limit : 0;
+    // Someone is waiting for interactive work, so it only rests for a busy CPU,
+    // not for other workers: a text search spends most of its time waiting on
+    // file opens, and the crowd rest made it 20 times slower.
+    const double crowd = kind == WorkKind::Background && limit > 0 && active > 1 ? static_cast<double>(active - 1) * active / limit : 0;
     return static_cast<unsigned>(std::min(400.0, fromCpu + crowd * 10));
 }
 
@@ -132,7 +135,7 @@ WorkSlot::~WorkSlot() {
 
 void WorkSlot::Pace() {
     if (index_ < 0 || GetTickCount64() - lastRest_ < 25) return;
-    const unsigned delay = PaceDelayMs(CpuPercent(), ActiveWorkers(), WorkerLimit());
+    const unsigned delay = PaceDelayMs(CpuPercent(), ActiveWorkers(), WorkerLimit(), kind_);
     if (delay) Sleep(delay);
     lastRest_ = GetTickCount64();
 }

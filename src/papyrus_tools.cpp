@@ -312,6 +312,39 @@ PapyrusResult PapyrusWorkspace::Guarded(bool compile, const std::wstring& input,
     return failed;
 }
 
+bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error) {
+    struct Call {
+        const uint8_t* data;
+        size_t size;
+        std::string* source;
+        std::wstring* error;
+        bool ok;
+    } call{data, size, &source, &error, false};
+    const bool finished = RunGuarded(
+        [](void* context) {
+            auto& c = *static_cast<Call*>(context);
+            try {
+                pex::Script script;
+                std::string message;
+                if (pex::read(c.data, c.size, script, &message) != pex::Status::Ok) {
+                    *c.error = L"can't be read as a compiled script: " + Widen(message);
+                    return;
+                }
+                pex::DecompileResult output = pex::decompile(script, pex::DecompileOptions{});
+                *c.source = std::move(output.source);
+                c.ok = true;
+            } catch (...) {
+                *c.error = L"couldn't be decompiled because of an internal error";
+            }
+        },
+        &call);
+    if (!finished) {
+        error = L"is too damaged or too deeply nested to decompile";
+        return false;
+    }
+    return call.ok;
+}
+
 PapyrusResult PapyrusWorkspace::Decompile(const std::wstring& pexPath, const std::wstring& target) { return Guarded(false, pexPath, target); }
 PapyrusResult PapyrusWorkspace::Compile(const std::wstring& pscPath, const std::wstring& target) { return Guarded(true, pscPath, target); }
 

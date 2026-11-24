@@ -1,6 +1,8 @@
 // Decompiles .pex and compiles .psc with the skqe-papyrus-decompiler library.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -11,6 +13,12 @@ namespace pse {
 // Scripts\Source or Source\Scripts, and next to its .psc otherwise.
 std::wstring DecompiledScriptPath(const std::wstring& pex);
 std::wstring CompiledScriptPath(const std::wstring& psc);
+
+// Decompiles a .pex held in memory to source text (default options, no
+// resolver), for Search text. Safe to call from any thread: a hostile script
+// that overflows the stack or crashes the decoder fails the call, not the
+// process. False with `error` set when it can't be done.
+bool DecompilePexBytes(const uint8_t* data, size_t size, std::string& source, std::wstring& error);
 
 struct PapyrusResult {
     int status = 2;  // 0 done, 1 done with warnings, 2 failed, 3 the input can't be read

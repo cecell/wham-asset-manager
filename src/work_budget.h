@@ -43,7 +43,8 @@ int WorkerLimit();
 int ActiveWorkers();
 
 // How long to rest (ms) at this system CPU percentage and this many workers.
-// It rises with both, and is what makes work back off as the UI comes under load.
-unsigned PaceDelayMs(int cpuPercent, int active, int limit);
+// It rises with both (interactive work: only with the CPU), and is what makes
+// work back off as the UI comes under load.
+unsigned PaceDelayMs(int cpuPercent, int active, int limit, WorkKind kind = WorkKind::Background);
 
 }  // namespace pse

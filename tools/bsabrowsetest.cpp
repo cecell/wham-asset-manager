@@ -256,6 +256,8 @@ int Budget() {
     Check(rises && last >= 150, L"it slows more as the CPU gets busier");
     Check(PaceDelayMs(30, 4, 4) > PaceDelayMs(30, 1, 4), L"it slows more with more workers");
     Check(PaceDelayMs(100, 64, 1) <= 400, L"a rest is never longer than the cap");
+    Check(PaceDelayMs(30, 6, 6, WorkKind::Interactive) == 0, L"interactive work doesn't rest for other workers");
+    Check(PaceDelayMs(95, 1, 4, WorkKind::Interactive) >= 150, L"interactive work still rests for a busy CPU");
     const int limit = WorkerLimit();
     wprintf(L"     limit %d, active now %d\n", limit, ActiveWorkers());
     Check(limit >= 1 && limit <= 64, L"the limit is sensible");
